@@ -97,20 +97,14 @@ class DreamerPilot:
         cfg = self.cfg
         device = self.device
 
-        # Resize image to model input size  (64×64)
-        try:
-            from PIL import Image as PILImage
-            img_resized = np.array(
-                PILImage.fromarray(image).resize((cfg.image_size, cfg.image_size)),
-                dtype=np.uint8,
-            )
-        except ImportError:
-            # Nearest-neighbour fallback
-            h_ratio = image.shape[0] / cfg.image_size
-            w_ratio = image.shape[1] / cfg.image_size
-            img_resized = image[
-                (np.arange(cfg.image_size) * h_ratio).astype(int), :, :][:, (
-                np.arange(cfg.image_size) * w_ratio).astype(int), :]
+        # Preprocessing: crop top fraction then resize — must match donkey_env.py exactly
+        from PIL import Image as PILImage
+        h = image.shape[0]
+        img_cropped = image[int(h * cfg.IMG_CROP_TOP):, :, :]          # remove ceiling rows
+        img_resized = np.array(
+            PILImage.fromarray(img_cropped).resize((cfg.IMG_W, cfg.IMG_H), PILImage.BILINEAR),
+            dtype=np.uint8,
+        )   # → (IMG_H, IMG_W, 3)  e.g. (58, 128, 3)
 
         # (H, W, 3) → (1, 3, H, W) tensor
         img_t = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).to(device)  # (1, 3, H, W)

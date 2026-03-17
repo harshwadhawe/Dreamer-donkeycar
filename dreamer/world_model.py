@@ -56,22 +56,41 @@ def unimix_probs(logits: Tensor, unimix: float = 0.01) -> Tensor:
 # CNN Encoder   (paper §App.B — "CNN")
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _conv_out(size: int, k: int = 4, s: int = 2, p: int = 1) -> int:
+    """Spatial dimension after one Conv2d(kernel=k, stride=s, padding=p)."""
+    return (size + 2 * p - k) // s + 1
+
+
+def _deconv_out(size: int, k: int = 4, s: int = 2, p: int = 1) -> int:
+    """Spatial dimension after one ConvTranspose2d(kernel=k, stride=s, padding=p)."""
+    return (size - 1) * s - 2 * p + k
+
+
 class CNNEncoder(nn.Module):
     """
-    Residual CNN encoder: (B, 3, 64, 64) → (B, embed_dim).
-    Depth multiplier doubles every layer as in the paper.
+    CNN encoder: (B, 3, IMG_H, IMG_W) → (B, embed_dim).
+    Spatial dims are computed dynamically — no hardcoded 64×64 assumptions.
+    Depth doubles each layer: 48 → 96 → 192 → 384.
     """
-    def __init__(self, embed_dim: int = 512, depth: int = 48):
+    def __init__(self, img_h: int, img_w: int, embed_dim: int = 512, depth: int = 48):
         super().__init__()
-        # channel sizes: depth * [1, 2, 4, 8]  →  48, 96, 192, 384
         channels = [3] + [depth * (2 ** i) for i in range(4)]
         self.convs = nn.ModuleList([
             nn.Conv2d(channels[i], channels[i + 1], kernel_size=4, stride=2, padding=1)
             for i in range(4)
         ])
-        self.norms = nn.ModuleList([nn.LayerNorm([channels[i + 1], 64 >> (i + 1), 64 >> (i + 1)])
-                                    for i in range(4)])
-        flat_size = channels[-1] * 4 * 4   # 384 * 4 * 4 = 6144 after 4 strides
+        # Compute spatial dims after each conv to build correct LayerNorm shapes
+        h, w = img_h, img_w
+        spatial = []
+        for _ in range(4):
+            h, w = _conv_out(h), _conv_out(w)
+            spatial.append((h, w))
+        # e.g. 58×128 → 29×64 → 14×32 → 7×16 → 3×8
+        self.norms = nn.ModuleList([
+            nn.LayerNorm([channels[i + 1], spatial[i][0], spatial[i][1]])
+            for i in range(4)
+        ])
+        flat_size = channels[-1] * spatial[-1][0] * spatial[-1][1]  # 384 * 3 * 8 = 9216
         self.out = nn.Linear(flat_size, embed_dim)
         self.out_ln = nn.LayerNorm(embed_dim)
 
@@ -90,15 +109,27 @@ class CNNEncoder(nn.Module):
 
 class CNNDecoder(nn.Module):
     """
-    Transposed-CNN decoder: (B, latent_dim) → (B, 3, 64, 64) in [0,1].
-    Mirrors the encoder.
+    Transposed-CNN decoder: (B, latent_dim) → (B, 3, IMG_H, IMG_W).
+    Mirrors the encoder. Starts from the same spatial seed as the encoder's
+    final feature map (e.g. 3×8 for 58×128 input), doubles each step, then
+    bilinearly interpolates to the exact target size.
     """
-    def __init__(self, latent_dim: int, depth: int = 48):
+    def __init__(self, latent_dim: int, img_h: int, img_w: int, depth: int = 48):
         super().__init__()
+        self.img_h = img_h
+        self.img_w = img_w
+
         channels = [depth * (2 ** i) for i in range(4)][::-1]   # 384, 192, 96, 48
-        self.in_proj = nn.Linear(latent_dim, channels[0] * 4 * 4)
-        self.in_ln = nn.LayerNorm(channels[0] * 4 * 4)
         self.ch0 = channels[0]
+
+        # Spatial seed = encoder's final spatial dims (e.g. 3×8 for 58×128)
+        h, w = img_h, img_w
+        for _ in range(4):
+            h, w = _conv_out(h), _conv_out(w)
+        self.h0, self.w0 = h, w   # e.g. 3, 8
+
+        self.in_proj = nn.Linear(latent_dim, self.ch0 * self.h0 * self.w0)
+        self.in_ln = nn.LayerNorm(self.ch0 * self.h0 * self.w0)
 
         layer_channels = channels + [3]
         self.deconvs = nn.ModuleList([
@@ -106,20 +137,32 @@ class CNNDecoder(nn.Module):
                                kernel_size=4, stride=2, padding=1)
             for i in range(4)
         ])
+        # Compute spatial dims after each deconv for LayerNorm shapes
+        dh, dw = self.h0, self.w0
+        deconv_spatial = []
+        for _ in range(4):
+            dh, dw = _deconv_out(dh), _deconv_out(dw)
+            deconv_spatial.append((dh, dw))
+        # e.g. 3×8 → 6×16 → 12×32 → 24×64 → 48×128  (then interp to 58×128)
         self.norms = nn.ModuleList([
-            nn.LayerNorm([layer_channels[i + 1], 4 * (2 ** (i + 1)), 4 * (2 ** (i + 1))])
+            nn.LayerNorm([layer_channels[i + 1], deconv_spatial[i][0], deconv_spatial[i][1]])
             for i in range(3)
         ])
 
     def forward(self, latent: Tensor) -> Tensor:
-        """Returns reconstructed image logits (no sigmoid); apply sigmoid for probabilities."""
+        """Returns reconstructed image logits (B, 3, IMG_H, IMG_W)."""
         x = F.silu(self.in_ln(self.in_proj(latent)))
-        x = x.view(x.shape[0], self.ch0, 4, 4)
+        x = x.view(x.shape[0], self.ch0, self.h0, self.w0)
         for i, deconv in enumerate(self.deconvs):
             x = deconv(x)
             if i < len(self.norms):
                 x = F.silu(self.norms[i](x))
-        return x   # (B, 3, 64, 64) — logits for Bernoulli / MSE target
+        # Bilinear upsample to exact target size when deconv output ≠ target
+        # e.g. 48×128 → 58×128  (height differs due to non-power-of-2 input)
+        if x.shape[-2:] != (self.img_h, self.img_w):
+            x = F.interpolate(x, size=(self.img_h, self.img_w),
+                              mode='bilinear', align_corners=False)
+        return x
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -354,10 +397,10 @@ class WorldModel(nn.Module):
     def __init__(self, cfg: DreamerConfig):
         super().__init__()
         self.cfg = cfg
-        self.encoder = CNNEncoder(embed_dim=cfg.rssm_embed)
+        self.encoder = CNNEncoder(img_h=cfg.IMG_H, img_w=cfg.IMG_W, embed_dim=cfg.rssm_embed)
         self.rssm = RSSM(cfg)
         latent_dim = cfg.rssm_hidden + cfg.rssm_categories * cfg.rssm_classes  # h + z
-        self.decoder = CNNDecoder(latent_dim=latent_dim)
+        self.decoder = CNNDecoder(latent_dim=latent_dim, img_h=cfg.IMG_H, img_w=cfg.IMG_W)
         self.reward_head = MLP(latent_dim, 1, cfg.mlp_hidden)
         self.cont_head   = MLP(latent_dim, 1, cfg.mlp_hidden)   # logit for p(continue)
 
@@ -372,7 +415,7 @@ class WorldModel(nn.Module):
         Returns (total_loss, metrics_dict).
 
         batch keys:
-            'image'       (T, B, 3, 64, 64)  — uint8
+            'image'       (T, B, 3, IMG_H, IMG_W)  — uint8
             'action'      (T, B, A)
             'reward'      (T, B)
             'is_first'    (T, B)
@@ -380,9 +423,10 @@ class WorldModel(nn.Module):
         """
         T, B = batch['image'].shape[:2]
         device = batch['image'].device
+        H_img, W_img = self.cfg.IMG_H, self.cfg.IMG_W
 
         # ── Encode all images simultaneously ──────────────────────────────
-        imgs = batch['image'].reshape(T * B, 3, self.cfg.image_size, self.cfg.image_size)
+        imgs = batch['image'].reshape(T * B, 3, H_img, W_img)
         embeds = self.encoder(imgs).reshape(T, B, -1)   # (T, B, E)
 
         # ── RSSM posterior rollout ─────────────────────────────────────────
@@ -393,12 +437,8 @@ class WorldModel(nn.Module):
 
         # ── Reconstruction loss  (symlog MSE)   [paper §App.B Eq.~decoder] ──
         feat_flat = feat.reshape(T * B, -1)
-        recon_logits = self.decoder(feat_flat).reshape(T, B, 3,
-                                                        self.cfg.image_size,
-                                                        self.cfg.image_size)
-        target_symlog = symlog(imgs.float().reshape(T, B, 3,
-                                                     self.cfg.image_size,
-                                                     self.cfg.image_size))
+        recon_logits = self.decoder(feat_flat).reshape(T, B, 3, H_img, W_img)
+        target_symlog = symlog(imgs.float().reshape(T, B, 3, H_img, W_img))
         rec_loss = F.mse_loss(recon_logits, target_symlog)
 
         # ── Reward prediction loss   (symlog targets)   [paper §App.B] ──────

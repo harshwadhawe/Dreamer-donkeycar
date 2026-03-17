@@ -12,7 +12,11 @@ from dataclasses import dataclass, field, fields
 class DreamerConfig:
     # ── Data / Environment ──────────────────────────────────────────────────
     tubs: str = "data/"                 # path to donkeycar tub directory
-    image_size: int = 64                # resize camera frames to (C, H, W) = (3, 64, 64)
+    # Image preprocessing: native 160×120 → crop top 40% → resize to 128×58
+    # Cropping removes ceiling/girders; aspect ratio 2.22:1 preserved.
+    IMG_H: int = 58                     # model input height (pixels)
+    IMG_W: int = 128                    # model input width  (pixels)
+    IMG_CROP_TOP: float = 0.4          # fraction of original height removed from top
     action_dim: int = 2                 # [steering, throttle] ∈ [-1, 1]
 
     # ── Training schedule ───────────────────────────────────────────────────

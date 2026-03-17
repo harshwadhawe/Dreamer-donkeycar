@@ -78,7 +78,7 @@ class ReplayBuffer:
         Sample a batch of sequences.
 
         Returns dict with keys tensored to (T, B, *):
-            'image'       (T, B, 3, image_size, image_size)  float32
+            'image'       (T, B, 3, IMG_H, IMG_W)  float32
             'action'      (T, B, A)
             'reward'      (T, B)
             'is_first'    (T, B)
@@ -92,7 +92,8 @@ class ReplayBuffer:
 
         T = seq_len
         B = batch_size
-        img_size = self.cfg.image_size
+        img_h = self.cfg.IMG_H
+        img_w = self.cfg.IMG_W
 
         # Images: (B, T, H, W, 3) → transpose → (T, B, 3, H, W)
         raw_imgs = np.array(collect_key('image'), dtype=np.uint8)   # (B, T, H, W, 3)

@@ -68,7 +68,7 @@ def train(cfg) -> None:
     print(f"[Train] Steps: {cfg.steps}, batch={cfg.batch_size}×{cfg.batch_seq_len}")
 
     # ── Load tub data ─────────────────────────────────────────────────────────
-    env = DonkeyTubEnv(tub_dir=cfg.tubs, image_size=cfg.image_size)
+    env = DonkeyTubEnv(tub_dir=cfg.tubs, cfg=cfg)
     buffer: ReplayBuffer = env.load_into_buffer(cfg)
 
     if not buffer.ready():

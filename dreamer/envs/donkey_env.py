@@ -32,27 +32,24 @@ from typing import List, Optional
 
 import numpy as np
 
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-    import imageio  # fallback
+from PIL import Image
 
 
-def _load_image(path: str, target_size: int = 64) -> np.ndarray:
-    """Load image from path, resize to (target_size, target_size, 3) uint8."""
-    if HAS_PIL:
-        img = Image.open(path).convert("RGB").resize((target_size, target_size))
-        return np.array(img, dtype=np.uint8)
-    else:
-        img = imageio.imread(path)
-        if img.ndim == 2:
-            img = np.stack([img] * 3, axis=-1)
-        img = img[:, :, :3]
-        # Simple bilinear resize via PIL-less approach (nearest-neighbour)
-        from PIL import Image as _PIL
-        return np.array(_PIL.fromarray(img).resize((target_size, target_size)), dtype=np.uint8)
+def _load_image(path: str, img_h: int, img_w: int, crop_top: float) -> np.ndarray:
+    """
+    Load image, crop top fraction, resize to (img_h, img_w, 3) uint8.
+
+    Pipeline (matches donkey_adapter.py inference path):
+        160×120  →  crop top 40%  →  160×72  →  resize  →  128×58
+    """
+    img = np.array(Image.open(path).convert("RGB"), dtype=np.uint8)  # (H, W, 3)
+    h = img.shape[0]
+    img = img[int(h * crop_top):, :, :]          # remove top fraction  (120 → 72 rows)
+    img = np.array(
+        Image.fromarray(img).resize((img_w, img_h), Image.BILINEAR),  # PIL: (width, height)
+        dtype=np.uint8,
+    )                                              # → (58, 128, 3)
+    return img
 
 
 class DonkeyTubEnv:
@@ -61,13 +58,16 @@ class DonkeyTubEnv:
 
     Usage
     -----
-    env = DonkeyTubEnv(tub_dir="data/", image_size=64)
+    env = DonkeyTubEnv(tub_dir="data/", cfg=cfg)
     buffer = env.load_into_buffer(cfg)
     """
 
-    def __init__(self, tub_dir: str = "data/", image_size: int = 64):
+    def __init__(self, tub_dir: str = "data/", cfg=None):
         self.tub_dir = tub_dir
-        self.image_size = image_size
+        # Image dimensions come from cfg; fall back to defaults if cfg not provided
+        self.img_h     = cfg.IMG_H        if cfg else 58
+        self.img_w     = cfg.IMG_W        if cfg else 128
+        self.crop_top  = cfg.IMG_CROP_TOP if cfg else 0.4
 
     # ── Tub discovery & loading ───────────────────────────────────────────────
 
@@ -137,7 +137,7 @@ class DonkeyTubEnv:
                 continue
 
             try:
-                image = _load_image(img_path, self.image_size)
+                image = _load_image(img_path, self.img_h, self.img_w, self.crop_top)
             except Exception:
                 continue
 
@@ -213,7 +213,7 @@ class DonkeyTubEnv:
         for i in range(num_steps):
             ep.add({
                 "image":       rng.integers(0, 255,
-                                            (cfg.image_size, cfg.image_size, 3),
+                                            (cfg.IMG_H, cfg.IMG_W, 3),
                                             dtype=np.uint8),
                 "action":      rng.uniform(-1, 1, (cfg.action_dim,)).astype(np.float32),
                 "reward":      float(rng.uniform(-0.1, 0.5)),
