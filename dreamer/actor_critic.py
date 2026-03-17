@@ -234,7 +234,12 @@ def actor_critic_loss(
     # Use target critic (slow EMA) for stable bootstrap values if available,
     # otherwise fall back to live critic.
     value_critic = target_critic if target_critic is not None else critic
-    feat_with_boot = torch.cat([feats, feats[-1:].detach()], dim=0)   # (H+1, B, d)
+
+    # Bootstrap at step H uses s_H = [h_H, z_H] from imag (the state AFTER the
+    # last imagined transition), not feats[-1] = s_{H-1}.  imag['h'][-1] = h_H
+    # and imag['z'][-1] = z_H are available after the imagine() ordering fix.
+    boot_feat = torch.cat([imag['h'][-1:], imag['z'][-1:]], dim=-1).detach()  # (1, B, d)
+    feat_with_boot = torch.cat([feats, boot_feat], dim=0)   # (H+1, B, d)
     values = value_critic.value(feat_with_boot.view((H + 1) * B, -1), bins).view(H + 1, B)
 
     # ── Lambda-returns   [paper §3, Eq. 6] ──────────────────────────────────

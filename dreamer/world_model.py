@@ -266,34 +266,47 @@ class RSSM(nn.Module):
     ) -> Dict[str, Tensor]:
         """
         Roll RSSM over a sequence with posterior updates.
+
+        Correct step ordering per paper §2:
+          1. h_t  = GRU(h_{t-1}, z_{t-1}, a_{t-1})   [Eq.1 — uses PREVIOUS z and a]
+          2. z_t  ~ p(z_t | h_t)                       [prior — conditioned on NEW h]
+          3. z_t  ~ q(z_t | h_t, x_t)                  [posterior — conditioned on NEW h]
+
         Returns dict with keys:
-            'h'          (T, B, H)
-            'z'          (T, B, C*K)
-            'prior_logits'    (T, B, C, K)
-            'post_logits'     (T, B, C, K)
+            'h'             (T, B, H)
+            'z'             (T, B, C*K)
+            'prior_logits'  (T, B, C, K)
+            'post_logits'   (T, B, C, K)
         """
         T, B = embeds.shape[:2]
         device = embeds.device
         h, z = self.initial_state(B, device)
+        # Track previous action; a_{-1} = 0 (no action before the first step)
+        a_prev = torch.zeros(B, self.cfg.action_dim, device=device)
 
         hs, zs, prior_logits_list, post_logits_list = [], [], [], []
 
         for t in range(T):
             # Reset state at episode boundaries
             first_mask = is_first[t].unsqueeze(-1).float()   # (B, 1)
-            h = h * (1.0 - first_mask)
-            z = z * (1.0 - first_mask)
+            h      = h      * (1.0 - first_mask)
+            z      = z      * (1.0 - first_mask)
+            a_prev = a_prev * (1.0 - first_mask)
 
-            # Prior: predict z from h (before seeing embed)  [paper §2 Eq.2]
+            # Step 1: Deterministic transition using PREVIOUS (z_{t-1}, a_{t-1})
+            # h_t = GRU(h_{t-1}, z_{t-1}, a_{t-1})   [paper §2 Eq.1]
+            img_in = self.img_in(torch.cat([z, a_prev], dim=-1))
+            h = self.gru_ln(self.gru_cell(img_in, h))
+
+            # Step 2: Prior and posterior both conditioned on the NEW h_t
+            # p(z_t | h_t)   [paper §2 Eq.2]
             prior_logit = self.prior_head(h).view(B, self.C, self.K)
-
-            # Posterior: refine z using image embed  [paper §2 Eq.3]
+            # q(z_t | h_t, x_t)   [paper §2 Eq.3]
             post_logit = self.post_head(torch.cat([h, embeds[t]], dim=-1)).view(B, self.C, self.K)
             z = self._sample_z(post_logit)   # (B, C*K)
 
-            # Recurrent update with (z, a)  [paper §2 Eq.1]
-            img_in = self.img_in(torch.cat([z, actions[t]], dim=-1))
-            h = self.gru_ln(self.gru_cell(img_in, h))
+            # Carry current action forward as a_{t-1} for the next step
+            a_prev = actions[t]
 
             hs.append(h)
             zs.append(z)
@@ -301,8 +314,8 @@ class RSSM(nn.Module):
             post_logits_list.append(post_logit)
 
         return {
-            'h': torch.stack(hs),                      # (T, B, H)
-            'z': torch.stack(zs),                      # (T, B, C*K)
+            'h': torch.stack(hs),                             # (T, B, H)
+            'z': torch.stack(zs),                             # (T, B, C*K)
             'prior_logits': torch.stack(prior_logits_list),   # (T, B, C, K)
             'post_logits':  torch.stack(post_logits_list),    # (T, B, C, K)
         }
@@ -316,27 +329,41 @@ class RSSM(nn.Module):
     ) -> Dict[str, Tensor]:
         """
         Imagination rollout using prior only (no observations).   [paper §3]
+
+        Correct step ordering per paper §2 (mirrors observe()):
+          1. feat   = [h_t, z_t]                           — current model state
+          2. a_t    = actor(feat)
+          3. h_{t+1} = GRU(h_t, z_t, a_t)                 — transition with CURRENT z
+          4. z_{t+1} ~ p(z_{t+1} | h_{t+1})               — prior from NEW h
+
         Returns dict with keys: 'h', 'z', 'features', 'actions'   each (H, B, .).
+          'features'[t] = [h_t, z_t]   — state at step t (before transition)
+          'h'[t]        = h_{t+1}      — deterministic state after step t
+          'z'[t]        = z_{t+1}      — stochastic state after step t
         """
         B = h.shape[0]
         hs, zs, feats, acts = [], [], [], []
 
         for _ in range(horizon):
+            # Step 1: current state features
             feat = torch.cat([h, z], dim=-1)    # (B, H + C*K)
+            # Step 2: actor action from current state
             action = actor_fn(feat)             # (B, A)
 
-            # Prior step  [paper §2 Eq.2]
-            prior_logit = self.prior_head(h).view(B, self.C, self.K)
-            z = self._sample_z(prior_logit)
-
-            # Recurrent step
+            # Step 3: GRU transition using CURRENT z (before prior sample)
+            # h_{t+1} = GRU(h_t, z_t, a_t)   [paper §2 Eq.1]
             img_in = self.img_in(torch.cat([z, action], dim=-1))
             h = self.gru_ln(self.gru_cell(img_in, h))
 
-            hs.append(h)
-            zs.append(z)
-            feats.append(feat)
-            acts.append(action)
+            # Step 4: prior sample conditioned on NEW h_{t+1}
+            # z_{t+1} ~ p(z_{t+1} | h_{t+1})   [paper §2 Eq.2]
+            prior_logit = self.prior_head(h).view(B, self.C, self.K)
+            z = self._sample_z(prior_logit)
+
+            feats.append(feat)    # [h_t, z_t]
+            acts.append(action)   # a_t
+            hs.append(h)          # h_{t+1}
+            zs.append(z)          # z_{t+1}
 
         return {
             'h':        torch.stack(hs),      # (H, B, H_dim)

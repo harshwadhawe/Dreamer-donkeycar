@@ -116,18 +116,24 @@ class DreamerPilot:
         # Encode image
         embed = self.world_model.encoder(img_t.float())   # (1, E)
 
-        # RSSM posterior step (single time step, T=1)
-        action_t = torch.from_numpy(self._last_action).unsqueeze(0).to(device)  # (1, A)
-        is_first = torch.zeros(1, 1, device=device)   # not first
+        # Single-step RSSM posterior update, reusing stored (h, z) across calls.
+        # We do NOT call rssm.observe() because that always resets h, z to zeros.
+        # Instead we replicate the corrected per-step ordering from observe():
+        #   1. h_t  = GRU(h_{t-1}, z_{t-1}, a_{t-1})
+        #   2. z_t  ~ q(z_t | h_t, x_t)
+        rssm = self.world_model.rssm
+        a_prev = torch.from_numpy(self._last_action).unsqueeze(0).to(device)  # (1, A)
 
-        # Single-step observe
-        rssm_out = self.world_model.rssm.observe(
-            embed.unsqueeze(0),      # (1, 1, E)
-            action_t.unsqueeze(0),   # (1, 1, A)
-            is_first,                # (1, 1)
-        )
-        self._h = rssm_out['h'][0]   # (1, H)
-        self._z = rssm_out['z'][0]   # (1, C*K)
+        # Step 1: deterministic transition
+        img_in = rssm.img_in(torch.cat([self._z, a_prev], dim=-1))
+        h_new  = rssm.gru_ln(rssm.gru_cell(img_in, self._h))
+
+        # Step 2: posterior update conditioned on new h and current image embed
+        post_logit = rssm.post_head(torch.cat([h_new, embed], dim=-1)).view(1, rssm.C, rssm.K)
+        z_new = rssm._sample_z(post_logit)   # (1, C*K)
+
+        self._h = h_new
+        self._z = z_new
 
         # Compute action from features
         feat = torch.cat([self._h, self._z], dim=-1)   # (1, H+C*K)
