@@ -1,0 +1,61 @@
+# Training data (tub images and catalogs)
+data/
+
+# Trained models
+models/
+dreamer/checkpoints/
+
+# Logs
+logs/
+dreamer/logs/
+
+# Python
+**/__pycache__/
+*.py[cod]
+*.pyo
+**/*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+
+# Environments
+.env
+*.env
+# environment.yml is platform-specific (conda env export); use requirements.txt instead
+environment.yml
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Claude Code
+.claude/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# macOS
+.DS_Store
+.AppleDouble
+**/.DS_Store
+
+# Linux
+.fuse_hidden*
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/

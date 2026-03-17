@@ -1,0 +1,151 @@
+"""
+Donkeycar Vehicle Part wrapper for DreamerV3 live autopilot.
+
+This part can be added to the Donkeycar Vehicle pipeline alongside the
+camera and drivetrain parts. It receives `cam/image_array` as input and
+outputs `pilot/angle` and `pilot/throttle`.
+
+Usage in manage.py (do NOT modify manage.py — this is illustrative only):
+
+    from dreamer.donkey_adapter import DreamerPilot
+    pilot = DreamerPilot(cfg, checkpoint_path="dreamer/checkpoints/latest.pt")
+    V.add(pilot,
+          inputs=['cam/image_array'],
+          outputs=['pilot/angle', 'pilot/throttle'],
+          run_condition='run_pilot')
+"""
+from __future__ import annotations
+import os
+from typing import Optional, Tuple
+
+import numpy as np
+import torch
+
+from dreamer.config import DreamerConfig
+from dreamer.world_model import WorldModel
+from dreamer.actor_critic import Actor
+
+
+class DreamerPilot:
+    """
+    Donkeycar part wrapping a trained DreamerV3 actor for live inference.
+
+    The part maintains its own recurrent state (h, z) across time steps,
+    resetting at the start of each new episode.
+
+    Inputs  (from Donkeycar vehicle memory):
+        cam/image_array : np.ndarray (H, W, 3) uint8
+
+    Outputs (to Donkeycar vehicle memory):
+        pilot/angle     : float ∈ [-1, 1]
+        pilot/throttle  : float ∈ [-1, 1]
+    """
+
+    def __init__(self, cfg: DreamerConfig, checkpoint_path: str):
+        self.cfg = cfg
+        dev = cfg.device
+        if dev == "auto":
+            if torch.backends.mps.is_available():
+                dev = "mps"
+            elif torch.cuda.is_available():
+                dev = "cuda"
+            else:
+                dev = "cpu"
+        self.device = torch.device(dev)
+
+        # Load world model and actor
+        self.world_model = WorldModel(cfg).to(self.device)
+        feat_dim = cfg.rssm_hidden + cfg.rssm_categories * cfg.rssm_classes
+        self.actor = Actor(cfg, feat_dim).to(self.device)
+
+        if os.path.exists(checkpoint_path):
+            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            self.world_model.load_state_dict(ckpt['world_model'])
+            self.actor.load_state_dict(ckpt['actor'])
+            print(f"[DreamerPilot] Loaded checkpoint: {checkpoint_path}")
+        else:
+            print(f"[DreamerPilot] Warning: checkpoint not found at {checkpoint_path}. "
+                  "Running with random weights.")
+
+        self.world_model.eval()
+        self.actor.eval()
+
+        # Recurrent state (h, z) — persists across steps
+        self._h: Optional[torch.Tensor] = None
+        self._z: Optional[torch.Tensor] = None
+        self._last_action = np.zeros(cfg.action_dim, dtype=np.float32)
+
+    def reset(self) -> None:
+        """Reset recurrent state at episode start."""
+        self._h = None
+        self._z = None
+        self._last_action = np.zeros(self.cfg.action_dim, dtype=np.float32)
+
+    @torch.no_grad()
+    def run(self, image: np.ndarray) -> Tuple[float, float]:
+        """
+        Called once per vehicle loop step by Donkeycar.
+
+        Parameters
+        ----------
+        image : np.ndarray (H, W, 3) uint8 — raw camera frame
+
+        Returns
+        -------
+        (angle, throttle) : floats in [-1, 1]
+        """
+        cfg = self.cfg
+        device = self.device
+
+        # Resize image to model input size  (64×64)
+        try:
+            from PIL import Image as PILImage
+            img_resized = np.array(
+                PILImage.fromarray(image).resize((cfg.image_size, cfg.image_size)),
+                dtype=np.uint8,
+            )
+        except ImportError:
+            # Nearest-neighbour fallback
+            h_ratio = image.shape[0] / cfg.image_size
+            w_ratio = image.shape[1] / cfg.image_size
+            img_resized = image[
+                (np.arange(cfg.image_size) * h_ratio).astype(int), :, :][:, (
+                np.arange(cfg.image_size) * w_ratio).astype(int), :]
+
+        # (H, W, 3) → (1, 3, H, W) tensor
+        img_t = torch.from_numpy(img_resized).permute(2, 0, 1).unsqueeze(0).to(device)  # (1, 3, H, W)
+
+        # Initialise recurrent state on first call
+        if self._h is None:
+            self._h, self._z = self.world_model.rssm.initial_state(1, device)
+
+        # Encode image
+        embed = self.world_model.encoder(img_t.float())   # (1, E)
+
+        # RSSM posterior step (single time step, T=1)
+        action_t = torch.from_numpy(self._last_action).unsqueeze(0).to(device)  # (1, A)
+        is_first = torch.zeros(1, 1, device=device)   # not first
+
+        # Single-step observe
+        rssm_out = self.world_model.rssm.observe(
+            embed.unsqueeze(0),      # (1, 1, E)
+            action_t.unsqueeze(0),   # (1, 1, A)
+            is_first,                # (1, 1)
+        )
+        self._h = rssm_out['h'][0]   # (1, H)
+        self._z = rssm_out['z'][0]   # (1, C*K)
+
+        # Compute action from features
+        feat = torch.cat([self._h, self._z], dim=-1)   # (1, H+C*K)
+        action = self.actor(feat).squeeze(0).cpu().numpy()   # (A,)
+
+        self._last_action = action
+        angle    = float(np.clip(action[0], -1.0, 1.0))
+        throttle = float(np.clip(action[1], -1.0, 1.0))
+        return angle, throttle
+
+    # ── Donkeycar part interface ───────────────────────────────────────────────
+
+    def shutdown(self) -> None:
+        """Donkeycar part shutdown hook."""
+        pass
