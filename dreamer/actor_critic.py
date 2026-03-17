@@ -213,6 +213,7 @@ def actor_critic_loss(
     normalizer: ReturnNormalizer,
     cfg: DreamerConfig,
     bins: Tensor,
+    target_critic: "Critic | None" = None,   # slow EMA critic for stable bootstrap
 ) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]:
     """
     Compute actor and critic losses over an imagination rollout.
@@ -230,10 +231,11 @@ def actor_critic_loss(
         imag_cont = torch.sigmoid(cont_head(feat_flat)).view(H, B)
 
     # ── Critic values over imagination trajectory ────────────────────────────
-    # Include bootstrap: need V at t=1..H+1; feats only has 1..H,
-    # so use the last feature again for the bootstrap (detached)
+    # Use target critic (slow EMA) for stable bootstrap values if available,
+    # otherwise fall back to live critic.
+    value_critic = target_critic if target_critic is not None else critic
     feat_with_boot = torch.cat([feats, feats[-1:].detach()], dim=0)   # (H+1, B, d)
-    values = critic.value(feat_with_boot.view((H + 1) * B, -1), bins).view(H + 1, B)
+    values = value_critic.value(feat_with_boot.view((H + 1) * B, -1), bins).view(H + 1, B)
 
     # ── Lambda-returns   [paper §3, Eq. 6] ──────────────────────────────────
     with torch.no_grad():
@@ -258,6 +260,11 @@ def actor_critic_loss(
     # ── Actor loss: REINFORCE with normalised advantage   [paper §3] ─────────
     _, log_prob = actor.sample_with_log_prob(feats.view(H * B, -1))
     log_prob = log_prob.view(H, B)
+    # Clip log_prob from below to prevent tanh-saturation positive feedback:
+    # when policy std→max, the squashed Gaussian log_prob becomes large positive
+    # (via the Jacobian term -log(1-tanh²)), which amplifies REINFORCE gradients
+    # and causes a runaway collapse.
+    log_prob = log_prob.clamp(min=cfg.log_prob_min)
     advantage = (targets_norm - values[:H].detach() / normalizer.scale())
     actor_loss = -(log_prob * advantage.detach()).mean()
     # entropy bonus   [paper §3, actor objective]

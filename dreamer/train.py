@@ -30,19 +30,23 @@ def save_checkpoint(
     world_model: WorldModel,
     actor: Actor,
     critic: Critic,
+    target_critic,
     wm_optim: torch.optim.Optimizer,
-    ac_optim: torch.optim.Optimizer,
+    actor_optim: torch.optim.Optimizer,
+    critic_optim: torch.optim.Optimizer,
     cfg,
 ) -> None:
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     path = os.path.join(cfg.checkpoint_dir, f"ckpt_{step:08d}.pt")
     torch.save({
-        'step':        step,
-        'world_model': world_model.state_dict(),
-        'actor':       actor.state_dict(),
-        'critic':      critic.state_dict(),
-        'wm_optim':    wm_optim.state_dict(),
-        'ac_optim':    ac_optim.state_dict(),
+        'step':          step,
+        'world_model':   world_model.state_dict(),
+        'actor':         actor.state_dict(),
+        'critic':        critic.state_dict(),
+        'target_critic': target_critic.state_dict(),
+        'wm_optim':      wm_optim.state_dict(),
+        'actor_optim':   actor_optim.state_dict(),
+        'critic_optim':  critic_optim.state_dict(),
     }, path)
     # Write a "latest" symlink for easy loading
     latest = os.path.join(cfg.checkpoint_dir, "latest.pt")
@@ -88,12 +92,16 @@ def train(cfg) -> None:
     # Symlog-spaced bins for two-hot critic   [paper §App.B]
     bins = symlog_bins(cfg.twohot_low, cfg.twohot_high, cfg.twohot_bins, device)
 
-    # ── Optimisers ────────────────────────────────────────────────────────────
-    wm_optim = torch.optim.Adam(world_model.parameters(), lr=cfg.wm_lr, eps=cfg.eps)
-    ac_optim = torch.optim.Adam(
-        list(actor.parameters()) + list(critic.parameters()),
-        lr=cfg.ac_lr, eps=cfg.eps,
-    )
+    # ── Target critic (slow EMA of critic weights for stable bootstrap) ───────
+    import copy
+    target_critic = copy.deepcopy(critic).to(device)
+    for p in target_critic.parameters():
+        p.requires_grad_(False)
+
+    # ── Optimisers (separate per module, per DreamerV3 paper) ─────────────────
+    wm_optim     = torch.optim.Adam(world_model.parameters(), lr=cfg.wm_lr,  eps=cfg.eps)
+    actor_optim  = torch.optim.Adam(actor.parameters(),       lr=cfg.ac_lr,  eps=cfg.eps)
+    critic_optim = torch.optim.Adam(critic.parameters(),      lr=cfg.ac_lr,  eps=cfg.eps)
 
     logger = Logger(cfg, log_dir=os.path.join(cfg.checkpoint_dir, "..", "logs"))
 
@@ -118,45 +126,60 @@ def train(cfg) -> None:
 
         # ────────────────────────────────────────────────────────────────────
         # Phase 2: Actor-Critic training via imagination
+        # Delayed by wm_warmup steps so the world model has time to learn
+        # useful representations before the AC starts.
         # ────────────────────────────────────────────────────────────────────
-        world_model.eval()
-        actor.train()
-        critic.train()
+        if step <= cfg.wm_warmup:
+            ac_metrics = {
+                'ac/critic_loss': 0.0, 'ac/actor_loss': 0.0,
+                'ac/mean_return': 0.0, 'ac/return_scale': 1.0,
+            }
+        else:
+            world_model.eval()
+            actor.train()
+            critic.train()
 
-        # Use posterior states from the world-model batch as imagination seeds
-        with torch.no_grad():
-            T, B = rssm_out['h'].shape[:2]
-            # Flatten (T, B) → (T*B,) and pick a random subset as starting states
-            h_flat = rssm_out['h'].view(T * B, -1).detach()
-            z_flat = rssm_out['z'].view(T * B, -1).detach()
-            idx = torch.randperm(T * B, device=device)[:B]
-            h0 = h_flat[idx]
-            z0 = z_flat[idx]
+            # Use posterior states from the world-model batch as imagination seeds
+            with torch.no_grad():
+                T, B = rssm_out['h'].shape[:2]
+                h_flat = rssm_out['h'].view(T * B, -1).detach()
+                z_flat = rssm_out['z'].view(T * B, -1).detach()
+                idx = torch.randperm(T * B, device=device)[:B]
+                h0 = h_flat[idx]
+                z0 = z_flat[idx]
 
-            # Imagination rollout  [paper §3]
-            imag = world_model.rssm.imagine(
-                h0, z0,
-                actor_fn=actor,
-                horizon=cfg.imag_horizon,
+                imag = world_model.rssm.imagine(
+                    h0, z0,
+                    actor_fn=actor,
+                    horizon=cfg.imag_horizon,
+                )
+
+            actor_loss, critic_loss, ac_metrics = actor_critic_loss(
+                actor, critic, imag,
+                reward_head=world_model.reward_head,
+                cont_head=world_model.cont_head,
+                normalizer=normalizer,
+                cfg=cfg,
+                bins=bins,
+                target_critic=target_critic,
             )
 
-        ac_optim.zero_grad()
-        actor_loss, critic_loss, ac_metrics = actor_critic_loss(
-            actor, critic, imag,
-            reward_head=world_model.reward_head,
-            cont_head=world_model.cont_head,
-            normalizer=normalizer,
-            cfg=cfg,
-            bins=bins,
-        )
-        total_ac = actor_loss + critic_loss
-        total_ac.backward()
-        # Gradient clipping: norm 100 for actor-critic  [paper §App.B]
-        torch.nn.utils.clip_grad_norm_(
-            list(actor.parameters()) + list(critic.parameters()),
-            cfg.ac_grad_clip,
-        )
-        ac_optim.step()
+            # Separate backward passes + gradient clipping per module
+            actor_optim.zero_grad()
+            actor_loss.backward(retain_graph=True)
+            torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg.ac_grad_clip)
+            actor_optim.step()
+
+            critic_optim.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(critic.parameters(), cfg.ac_grad_clip)
+            critic_optim.step()
+
+            # Update target critic via EMA
+            with torch.no_grad():
+                d = cfg.critic_ema_decay
+                for tp, cp in zip(target_critic.parameters(), critic.parameters()):
+                    tp.data.mul_(d).add_(cp.data, alpha=1.0 - d)
 
         # ────────────────────────────────────────────────────────────────────
         # Logging & checkpointing
@@ -171,10 +194,12 @@ def train(cfg) -> None:
                   f"critic={ac_metrics['ac/critic_loss']:.4f}")
 
         if step % cfg.save_every == 0:
-            save_checkpoint(step, world_model, actor, critic, wm_optim, ac_optim, cfg)
+            save_checkpoint(step, world_model, actor, critic, target_critic,
+                            wm_optim, actor_optim, critic_optim, cfg)
 
     # Final checkpoint
-    save_checkpoint(cfg.steps, world_model, actor, critic, wm_optim, ac_optim, cfg)
+    save_checkpoint(cfg.steps, world_model, actor, critic, target_critic,
+                    wm_optim, actor_optim, critic_optim, cfg)
     logger.close()
     print("[Train] Done.")
 

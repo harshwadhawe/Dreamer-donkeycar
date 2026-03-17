@@ -68,6 +68,11 @@ class DreamerConfig:
     wm_grad_clip: float = 1000.0       # world model (paper §App.B)
     ac_grad_clip: float = 100.0        # actor-critic (paper §App.B)
 
+    # ── Training stability ───────────────────────────────────────────────────
+    wm_warmup: int = 2000              # steps to train WM-only before starting AC
+    critic_ema_decay: float = 0.98     # EMA decay for slow target critic
+    log_prob_min: float = -10.0        # floor for actor log_prob (prevents tanh saturation runaway)
+
     # ── Logging / checkpointing ──────────────────────────────────────────────
     log_every: int = 100               # log metrics every N gradient steps
     save_every: int = 1000             # save checkpoint every N gradient steps

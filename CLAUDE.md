@@ -91,6 +91,33 @@ conda run -n dreamer-car python dreamer/train.py --steps 100
 
 # Calibrate servo / ESC (hardware only)
 conda run -n dreamer-car python calibrate.py
+
+# Test a checkpoint in the simulator (Shell 1: open sim, Shell 2: run this)
+conda run -n dreamer-car python drive_dreamer_sim.py
+conda run -n dreamer-car python drive_dreamer_sim.py --checkpoint dreamer/checkpoints/ckpt_00100000.pt
+conda run -n dreamer-car python drive_dreamer_sim.py --episodes 5 --max-steps 2000
+
+# Run DreamerV3 autopilot on the physical car (Raspberry Pi, no conda)
+python drive_dreamer.py
+python drive_dreamer.py --checkpoint dreamer/checkpoints/ckpt_00100000.pt
+python drive_dreamer.py --js   # with PS5 joystick
+```
+
+---
+
+## Quick Workflow (3 Commands)
+
+```bash
+# 1. Get the checkpoint from the remote GPU machine
+scp <gpu-host>:~/dreamer-car/dreamer/checkpoints/ckpt_00100000.pt \
+    ~/dreamer-car/dreamer/checkpoints/
+
+# 2. Start the simulator (separate window)
+open /Users/harshwadhawe/sim/DonkeySimMac/donkey_sim.app
+
+# 3. Run the autopilot against it
+conda run -n dreamer-car python drive_dreamer_sim.py \
+    --checkpoint dreamer/checkpoints/ckpt_00100000.pt
 ```
 
 ---
@@ -162,6 +189,109 @@ Config: `config.py` is read-only defaults. All overrides go in `myconfig.py` (un
 
 ---
 
+## Testing a Checkpoint in the Simulator (Current Workflow)
+
+Training runs on a remote GPU machine. Checkpoints are SCP'd to this Mac and tested in the DonkeyGym simulator before any physical car deployment.
+
+### Step 1 — Pull the checkpoint from the remote machine
+
+```bash
+# Run on this Mac — copies a specific checkpoint locally
+scp <gpu-host>:~/dreamer-car/dreamer/checkpoints/ckpt_00100000.pt \
+    ~/dreamer-car/dreamer/checkpoints/ckpt_00100000.pt
+```
+
+> Checkpoints are **not** in git (large binary files). Always copy via `scp`.
+> `latest.pt` on the remote is a symlink — copy the actual `.pt` file by step number.
+
+### Step 2 — Sync code changes via git
+
+```bash
+# On this Mac — push any code changes made here
+git add -p && git commit -m "your message"
+git push
+
+# On the GPU machine — pull before the next training run
+git pull
+```
+
+### Step 3 — Run the autopilot in the simulator
+
+**Shell 1** — start the simulator:
+```bash
+open /Users/harshwadhawe/sim/DonkeySimMac/donkey_sim.app
+```
+
+**Shell 2** — run DreamerV3 against it:
+```bash
+# Default: latest.pt, 3 episodes, 1000 steps each
+conda run -n dreamer-car python drive_dreamer_sim.py
+
+# Specific checkpoint
+conda run -n dreamer-car python drive_dreamer_sim.py \
+    --checkpoint dreamer/checkpoints/ckpt_00100000.pt
+
+# More episodes / longer runs
+conda run -n dreamer-car python drive_dreamer_sim.py --episodes 10 --max-steps 2000
+```
+
+The script prints per-episode step count and total reward. Use this to compare checkpoints.
+
+---
+
+## Deploying to the Physical Car (Future)
+
+Once a checkpoint passes simulator testing, deploy to the Raspberry Pi.
+
+### Pi one-time setup
+
+```bash
+# On the Pi — CPU-only PyTorch (ARM64)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+pip install -e ~/donkeycar --no-deps
+```
+
+### Copy checkpoint to the Pi
+
+```bash
+scp dreamer/checkpoints/ckpt_00100000.pt \
+    pi@<pi-ip>:~/dreamer-car/dreamer/checkpoints/
+```
+
+### Calibrate (first time only)
+
+```bash
+python calibrate.py   # verify PWM values match config.py
+```
+
+### Run the autopilot
+
+```bash
+# On the Pi
+python drive_dreamer.py --checkpoint dreamer/checkpoints/ckpt_00100000.pt
+python drive_dreamer.py --js    # with PS5 joystick override
+```
+
+Open **`http://<pi-ip>:8887`** — switch mode to `local` to engage autopilot.
+
+| Mode | Behaviour |
+|---|---|
+| `user` | Manual (web UI or joystick) |
+| `local` | DreamerV3 full autopilot |
+| `local_angle` | DreamerV3 steers, human throttle |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `ModuleNotFoundError: dreamer` | Run from `~/dreamer-car/` root |
+| PCA9685 I2C error | `i2cdetect -y 1`; check `PCA9685_I2C_ADDR` in myconfig.py |
+| Car steers wrong direction | Swap `STEERING_LEFT_PWM`/`STEERING_RIGHT_PWM` in myconfig.py |
+| `checkpoint not found` warning | `latest.pt` is a symlink — copy the actual `.pt` file |
+
+---
+
 ## DreamerV3 Architecture (`dreamer/`)
 
 Fully isolated from Donkeycar files. Never modify `manage.py`, `config.py`, or any existing Donkeycar file.
@@ -174,6 +304,8 @@ Fully isolated from Donkeycar files. Never modify `manage.py`, `config.py`, or a
 | `dreamer/replay_buffer.py` | Sequence replay buffer; `sample_batch()` → `(T, B, *)` tensors |
 | `dreamer/envs/donkey_env.py` | Reads tub NDJSON catalogs → `ReplayBuffer`; synthetic fallback if no tubs |
 | `dreamer/donkey_adapter.py` | Donkeycar part: `cam/image_array` → `pilot/angle`, `pilot/throttle` |
+| `drive_dreamer_sim.py` | Simulator test loop: runs DreamerPilot against DonkeyGym, prints reward per episode |
+| `drive_dreamer.py` | Physical car entry point: Donkeycar vehicle with DreamerPilot + PCA9685 drivetrain (Pi) |
 | `dreamer/logger.py` | WandB + TensorBoard logging, GIF video saving |
 | `dreamer/train.py` | Entry point: loads tubs → trains WM → trains AC → saves checkpoints |
 
