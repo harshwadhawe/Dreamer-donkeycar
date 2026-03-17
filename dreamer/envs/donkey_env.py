@@ -145,8 +145,11 @@ class DonkeyTubEnv:
             throttle = float(rec.get("user/throttle", 0.0))
 
             action = np.array([angle, throttle], dtype=np.float32)
-            # Compute a simple reward: forward progress proportional to throttle
-            reward = float(throttle)
+            # Reward: forward progress weighted by how straight the car is driving.
+            # Penalises large steering angles so the agent learns to stay on track
+            # rather than circling. throttle * (1 - |angle|) is 0 when spinning in
+            # place (throttle>0 but |angle|=1) and maximal when driving straight.
+            reward = float(throttle) * (1.0 - abs(angle))
 
             transitions.append({
                 "image":       image,                 # (H, W, 3) uint8
@@ -216,7 +219,7 @@ class DonkeyTubEnv:
                                             (cfg.IMG_H, cfg.IMG_W, 3),
                                             dtype=np.uint8),
                 "action":      rng.uniform(-1, 1, (cfg.action_dim,)).astype(np.float32),
-                "reward":      float(rng.uniform(-0.1, 0.5)),
+                "reward":      float(rng.uniform(0.0, 0.5)),   # throttle*(1-|angle|) is in [0,1]
                 "is_first":    float(i == 0),
                 "is_terminal": float(i == num_steps - 1),
             })

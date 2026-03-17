@@ -109,15 +109,16 @@ python drive_dreamer.py --js   # with PS5 joystick
 
 ```bash
 # 1. Get the checkpoint from the remote GPU machine
-scp <gpu-host>:~/dreamer-car/dreamer/checkpoints/ckpt_00100000.pt \
-    ~/dreamer-car/dreamer/checkpoints/
+scp 4060:~/harsh/Dreamer-donkeycar/dreamer/checkpoints/ckpt_00013000.pt ~/dreamer-car/dreamer/checkpoints/
 
 # 2. Start the simulator (separate window)
 open /Users/harshwadhawe/sim/DonkeySimMac/donkey_sim.app
 
+pkill -f donkey_sim                                                        
+~/sim/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim
+
 # 3. Run the autopilot against it
-conda run -n dreamer-car python drive_dreamer_sim.py \
-    --checkpoint dreamer/checkpoints/ckpt_00100000.pt
+conda run -n dreamer-car python drive_dreamer_sim.py  --checkpoint dreamer/checkpoints/ckpt_00013000.pt
 ```
 
 ---
