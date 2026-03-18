@@ -39,7 +39,7 @@ class DreamerConfig:
 
     # KL balancing (paper §App.B): α=0.8 → 80% prior, 20% posterior
     kl_balance: float = 0.8
-    kl_free: float = 0.1               # free-bits threshold (nats) — clip below this
+    kl_free: float = 1.0               # free-bits threshold (nats) per category  (paper §App.B)
     kl_scale: float = 1.0              # KL loss scale — back to 1.0; high kl_scale above the
                                        # free-bits floor has zero gradient (clamp kills it) and
                                        # actually harms z when KL > floor by over-penalising
@@ -51,20 +51,19 @@ class DreamerConfig:
     unimix: float = 0.01
 
     # ── Actor-Critic ─────────────────────────────────────────────────────────
-    imag_horizon: int = 8              # imagination rollout horizon H — reduced from 15
-                                       # shorter horizon = less OOD divergence when z is still learning
-    gamma: float = 0.997               # discount factor
+    imag_horizon: int = 15             # imagination rollout horizon H  (paper §App.B)
+    gamma: float = 0.997               # discount factor  (paper §App.B)
     lam: float = 0.95                  # λ for lambda-returns  (paper Eq. 6)
-    actor_entropy: float = 1e-3        # entropy regularisation weight — applied to Gaussian
+    actor_entropy: float = 3e-4         # entropy regularisation weight — applied to Gaussian
                                        # entropy (not clamped log_prob), so gradient always
-                                       # flows through log_std. Increased from 3e-4 to 1e-3
-                                       # to counteract tanh-saturation runaway.
-    actor_grad: str = "reinforce"      # "reinforce" or "dynamics" — use REINFORCE for discrete
+                                       # flows through log_std.
+    actor_grad: str = "dynamics"       # "dynamics" (continuous actions, paper default) or
+                                       # "reinforce" (discrete actions)
 
     # Two-hot bins for symlog-spaced critic targets (paper §App.B)
     twohot_bins: int = 255
-    twohot_low: float = -20.0
-    twohot_high: float = 20.0
+    twohot_low: float = -20.0          # paper default
+    twohot_high: float = 20.0          # paper default (symlog compresses large values)
 
     # Return normalisation: 5th–95th percentile  (paper §App.B)
     return_norm_perc_low: float = 0.05

@@ -153,6 +153,25 @@ class Actor(nn.Module):
 
         return action, log_prob, entropy
 
+    def log_prob_of(self, feat: Tensor, action: Tensor) -> Tuple[Tensor, Tensor]:
+        """
+        Compute log probability and entropy for given (already-sampled) actions.
+        Used for REINFORCE gradient with imagined actions.
+
+        Returns: (log_prob, entropy)  both (B,)
+        """
+        out = self.net(feat)
+        mean, log_std = out.chunk(2, dim=-1)
+        log_std = log_std.clamp(-5, 2)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mean, std)
+
+        # Inverse tanh to get pre-squash value
+        raw = torch.atanh(action.clamp(-0.999, 0.999))
+        log_prob = dist.log_prob(raw).sum(-1) - torch.log1p(-action.pow(2) + 1e-6).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        return log_prob, entropy
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Critic   (paper §3)
@@ -197,18 +216,20 @@ def lambda_returns(
 
     R_t^λ = r_t + γ * c_t * ((1-λ) * V_{t+1} + λ * R_{t+1}^λ)
 
-    Computed in reverse for efficiency.
+    Computed in reverse for efficiency.  Uses accumulator variable (not in-place
+    tensor assignment) so the computation graph is preserved for dynamics gradient.
     Returns: (H, B)
     """
     H, B = rewards.shape
-    returns = torch.zeros(H + 1, B, device=rewards.device)
-    returns[H] = values[H]   # bootstrap from V_{H+1}
+    last = values[H]   # bootstrap from V_{H+1}
+    returns = []
 
     for t in reversed(range(H)):
-        returns[t] = (rewards[t]
-                      + gamma * cont[t] * ((1 - lam) * values[t + 1]
-                                           + lam * returns[t + 1]))
-    return returns[:H]   # (H, B)
+        last = (rewards[t]
+                + gamma * cont[t] * ((1 - lam) * values[t + 1]
+                                     + lam * last))
+        returns.insert(0, last)
+    return torch.stack(returns)   # (H, B)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,79 +250,110 @@ def actor_critic_loss(
     """
     Compute actor and critic losses over an imagination rollout.
 
+    Supports two gradient modes (cfg.actor_grad):
+      - "dynamics": backprop through returns → imagination → actor  [continuous actions]
+      - "reinforce": score-function estimator with log_prob  [discrete actions]
+
     Returns: (actor_loss, critic_loss, metrics)
     """
-    feats   = imag['features']   # (H, B, feat_dim)
+    feats   = imag['features']   # (H, B, feat_dim)  — has grad for dynamics mode
     actions = imag['actions']    # (H, B, A)
     H, B = feats.shape[:2]
+    use_dynamics = (cfg.actor_grad == "dynamics")
 
-    # ── Predict rewards and continuation from imagined states ────────────────
-    feat_flat = feats.view(H * B, -1)
-    with torch.no_grad():
-        imag_rew  = reward_head(feat_flat).view(H, B).float()   # symlog rewards
-        # cont_head is unreliable when trained on tub data: is_terminal=1 only on the
-        # last frame of each recording session (human never crashed), so the head
-        # learns "always continue" → cont≈1 everywhere → BCE loss≈0.
-        # Use a fixed discount mask (all-ones) so gamma in lambda_returns provides
-        # the geometric discount instead of relying on the learned cont signal.
-        imag_cont = torch.ones(H, B, device=feat_flat.device)
+    feat_flat = feats.reshape(H * B, -1)
+    feat_flat_sg = feat_flat.detach()    # stop-gradient copy for critic / entropy
 
-    # ── Critic values over imagination trajectory ────────────────────────────
-    # Use target critic (slow EMA) for stable bootstrap values if available,
-    # otherwise fall back to live critic.
+    # ── Predict rewards from imagined states ──────────────────────────────────
+    # Dynamics: keep gradient through features → actor
+    # REINFORCE: no gradient needed
+    if use_dynamics:
+        imag_rew = reward_head(feat_flat).reshape(H, B).float()
+    else:
+        with torch.no_grad():
+            imag_rew = reward_head(feat_flat_sg).reshape(H, B).float()
+
+    # Use fixed continuation (all-ones) — cont_head trained on tub data has
+    # almost no negative examples so it predicts "always continue".
+    imag_cont = torch.ones(H, B, device=feat_flat.device)
+
+    # ── Critic values (always detached from imagination graph) ────────────────
     value_critic = target_critic if target_critic is not None else critic
+    boot_feat = torch.cat([imag['h'][-1:], imag['z'][-1:]], dim=-1).detach()
+    feat_with_boot = torch.cat([feats.detach(), boot_feat], dim=0)   # (H+1, B, d)
+    values = value_critic.value(
+        feat_with_boot.reshape((H + 1) * B, -1), bins
+    ).reshape(H + 1, B)
 
-    # Bootstrap at step H uses s_H = [h_H, z_H] from imag (the state AFTER the
-    # last imagined transition), not feats[-1] = s_{H-1}.  imag['h'][-1] = h_H
-    # and imag['z'][-1] = z_H are available after the imagine() ordering fix.
-    boot_feat = torch.cat([imag['h'][-1:], imag['z'][-1:]], dim=-1).detach()  # (1, B, d)
-    feat_with_boot = torch.cat([feats, boot_feat], dim=0)   # (H+1, B, d)
-    values = value_critic.value(feat_with_boot.view((H + 1) * B, -1), bins).view(H + 1, B)
-
-    # ── Lambda-returns   [paper §3, Eq. 6] ──────────────────────────────────
-    with torch.no_grad():
+    # ── Lambda-returns   [paper §3, Eq. 6] ────────────────────────────────────
+    if use_dynamics:
+        # Keep gradient: rewards → feat → imagination → actor
         targets = lambda_returns(
-            rewards=symexp(imag_rew),    # convert symlog rew → original scale
+            rewards=symexp(imag_rew),
             values=values.detach(),
             cont=imag_cont,
             lam=cfg.lam,
             gamma=cfg.gamma,
-        )   # (H, B)
+        )
+        targets_sg = targets.detach()
+    else:
+        with torch.no_grad():
+            targets = lambda_returns(
+                rewards=symexp(imag_rew),
+                values=values.detach(),
+                cont=imag_cont,
+                lam=cfg.lam,
+                gamma=cfg.gamma,
+            )
+        targets_sg = targets
 
-    # ── Update return normaliser   [paper §App.B] ────────────────────────────
-    normalizer.update(targets)
-    targets_norm = normalizer.normalize(targets)
+    # ── Update return normaliser   [paper §App.B] ──────────────────────────────
+    normalizer.update(targets_sg)
+    scale = normalizer.scale()
 
-    # ── Critic loss: two-hot cross-entropy on symlog targets   [paper §3] ────
-    critic_logits = critic(feats.view(H * B, -1)).view(H, B, -1)   # (H, B, bins)
-    # encode targets in symlog space
-    target_enc = two_hot_encode(symlog(targets.detach()), symlog(bins))   # (H, B, bins)
+    # ── Critic loss: two-hot cross-entropy on sg(targets)   [paper §3] ─────────
+    critic_logits = critic(feat_flat_sg).reshape(H, B, -1)
+    target_enc = two_hot_encode(symlog(targets_sg), symlog(bins))
     critic_loss = -(target_enc * F.log_softmax(critic_logits, dim=-1)).sum(-1).mean()
 
-    # ── Actor loss: REINFORCE with normalised advantage   [paper §3] ─────────
-    _, log_prob, entropy = actor.sample_with_log_prob(feats.view(H * B, -1))
-    log_prob = log_prob.view(H, B)
-    entropy  = entropy.view(H, B)
-    # Clamp log_prob to prevent tanh-Jacobian runaway on BOTH sides:
-    #   min: -log(1-tanh²) → +∞ when action→±1 gives large positive log_prob
-    #   max: Normal log_prob → +∞ when std→0 (very confident policy)
-    # Clamping kills gradient at the boundary — which is intentional: we stop
-    # REINFORCE from further rewarding saturated actions.
-    log_prob = log_prob.clamp(min=cfg.log_prob_min, max=cfg.log_prob_max)
-    advantage = (targets_norm - values[:H].detach() / normalizer.scale())
-    actor_loss = -(log_prob * advantage.detach()).mean()
-    # Entropy bonus uses the RAW Gaussian entropy (not clamped log_prob).
-    # Gradient flows through log_std even when log_prob is at the clamp boundary,
-    # so the policy is always pushed toward higher-entropy (less saturated) actions.
-    actor_loss = actor_loss - cfg.actor_entropy * entropy.mean()
+    # ── Entropy bonus (always, on detached features) ──────────────────────────
+    _, _, entropy = actor.sample_with_log_prob(feat_flat_sg)
+    entropy = entropy.reshape(H, B)
 
-    metrics = {
-        'ac/critic_loss':  critic_loss.item(),
-        'ac/actor_loss':   actor_loss.item(),
-        'ac/mean_return':  targets.mean().item(),
-        'ac/return_scale': normalizer.scale(),
-        'ac/log_prob':     log_prob.mean().item(),     # clamped; healthy: -3 to 0; ceiling=2.0 → saturated
-        'ac/entropy':      entropy.mean().item(),      # Gaussian entropy; healthy: 2-5; low → policy collapsed
-        'ac/advantage':    advantage.mean().item(),    # should hover near 0; large negative = critic overestimates
-    }
+    # ── Actor loss ────────────────────────────────────────────────────────────
+    if use_dynamics:
+        # Dynamics backprop: gradient flows through normalised returns → actor
+        actor_loss = -(targets / scale).mean()
+        actor_loss = actor_loss - cfg.actor_entropy * entropy.mean()
+
+        metrics = {
+            'ac/critic_loss':  critic_loss.item(),
+            'ac/actor_loss':   actor_loss.item(),
+            'ac/mean_return':  targets_sg.mean().item(),
+            'ac/return_scale': scale,
+            'ac/log_prob':     0.0,
+            'ac/entropy':      entropy.mean().item(),
+            'ac/advantage':    0.0,
+        }
+    else:
+        # REINFORCE: log_prob of the SAME imagined actions × advantage
+        log_prob, _ = actor.log_prob_of(feat_flat_sg, actions.detach().reshape(H * B, -1))
+        log_prob = log_prob.reshape(H, B)
+        log_prob = log_prob.clamp(min=cfg.log_prob_min, max=cfg.log_prob_max)
+
+        targets_norm = targets_sg / scale
+        advantage = targets_norm - values[:H].detach() / scale
+        actor_loss = -(log_prob * advantage.detach()).mean()
+        actor_loss = actor_loss - cfg.actor_entropy * entropy.mean()
+
+        metrics = {
+            'ac/critic_loss':  critic_loss.item(),
+            'ac/actor_loss':   actor_loss.item(),
+            'ac/mean_return':  targets_sg.mean().item(),
+            'ac/return_scale': scale,
+            'ac/log_prob':     log_prob.mean().item(),
+            'ac/entropy':      entropy.mean().item(),
+            'ac/advantage':    advantage.mean().item(),
+        }
+
     return actor_loss, critic_loss, metrics

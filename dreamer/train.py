@@ -154,26 +154,35 @@ def train(cfg) -> None:
             }
         else:
             if not _ac_started:
-                print(f"[Train] step={step}: WM warmup done — starting Actor-Critic training", flush=True)
+                print(f"[Train] step={step}: WM warmup done — starting Actor-Critic training "
+                      f"(grad={cfg.actor_grad})", flush=True)
                 _ac_started = True
+
             world_model.eval()
             actor.train()
             critic.train()
 
-            # Use posterior states from the world-model batch as imagination seeds
-            with torch.no_grad():
-                T, B = rssm_out['h'].shape[:2]
-                h_flat = rssm_out['h'].view(T * B, -1).detach()
-                z_flat = rssm_out['z'].view(T * B, -1).detach()
-                idx = torch.randperm(T * B, device=device)[:B]
-                h0 = h_flat[idx]
-                z0 = z_flat[idx]
+            # Freeze WM params so autograd doesn't store their activations.
+            # Gradient still flows THROUGH WM operations to the actor via the
+            # computation graph (needed for dynamics backprop).
+            for p in world_model.parameters():
+                p.requires_grad_(False)
 
-                imag = world_model.rssm.imagine(
-                    h0, z0,
-                    actor_fn=actor,
-                    horizon=cfg.imag_horizon,
-                )
+            # Use posterior states from the world-model batch as imagination seeds
+            T, B = rssm_out['h'].shape[:2]
+            h_flat = rssm_out['h'].reshape(T * B, -1).detach()
+            z_flat = rssm_out['z'].reshape(T * B, -1).detach()
+            idx = torch.randperm(T * B, device=device)[:B]
+            h0 = h_flat[idx]
+            z0 = z_flat[idx]
+
+            # Imagination: actor uses reparameterised stochastic samples
+            # so dynamics gradient flows through rsample → tanh → action.
+            imag = world_model.rssm.imagine(
+                h0, z0,
+                actor_fn=lambda feat: actor.sample_with_log_prob(feat)[0],
+                horizon=cfg.imag_horizon,
+            )
 
             actor_loss, critic_loss, ac_metrics = actor_critic_loss(
                 actor, critic, imag,
@@ -185,9 +194,10 @@ def train(cfg) -> None:
                 target_critic=target_critic,
             )
 
-            # Separate backward passes + gradient clipping per module
+            # Actor backward — graph connects through imagination → actor params.
+            # Critic uses detached features so no shared graph; retain_graph not needed.
             actor_optim.zero_grad()
-            actor_loss.backward(retain_graph=True)
+            actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg.ac_grad_clip)
             actor_optim.step()
 
@@ -195,6 +205,10 @@ def train(cfg) -> None:
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(critic.parameters(), cfg.ac_grad_clip)
             critic_optim.step()
+
+            # Unfreeze WM params for next WM training step
+            for p in world_model.parameters():
+                p.requires_grad_(True)
 
             # Update target critic via EMA
             with torch.no_grad():

@@ -141,7 +141,7 @@ class DonkeySimCollector:
         else:
             # Stochastic sample for diverse data collection
             feat = torch.cat([self._h, self._z], dim=-1)
-            action, _ = self.actor.sample_with_log_prob(feat)
+            action, _, _ = self.actor.sample_with_log_prob(feat)
             action = action.squeeze(0).cpu().numpy()
 
         return np.clip(action, -1.0, 1.0).astype(np.float32)
