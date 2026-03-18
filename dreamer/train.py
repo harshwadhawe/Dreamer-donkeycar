@@ -150,6 +150,7 @@ def train(cfg) -> None:
                 'ac/critic_loss': 0.0, 'ac/actor_loss': 0.0,
                 'ac/mean_return': 0.0, 'ac/return_scale': 1.0,
                 'ac/log_prob': 0.0,    'ac/advantage': 0.0,
+                'ac/entropy': 0.0,
             }
         else:
             if not _ac_started:
@@ -234,6 +235,7 @@ def train(cfg) -> None:
                 f"critic={ac_metrics['ac/critic_loss']:.4f}  "
                 f"ret={ac_metrics['ac/mean_return']:.4f}  "
                 f"logp={ac_metrics['ac/log_prob']:.3f}  "
+                f"ent={ac_metrics['ac/entropy']:.3f}  "
                 f"adv={ac_metrics['ac/advantage']:.3f}",
                 flush=True,
             )

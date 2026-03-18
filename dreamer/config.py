@@ -55,7 +55,10 @@ class DreamerConfig:
                                        # shorter horizon = less OOD divergence when z is still learning
     gamma: float = 0.997               # discount factor
     lam: float = 0.95                  # λ for lambda-returns  (paper Eq. 6)
-    actor_entropy: float = 3e-4        # entropy regularisation weight
+    actor_entropy: float = 1e-3        # entropy regularisation weight — applied to Gaussian
+                                       # entropy (not clamped log_prob), so gradient always
+                                       # flows through log_std. Increased from 3e-4 to 1e-3
+                                       # to counteract tanh-saturation runaway.
     actor_grad: str = "reinforce"      # "reinforce" or "dynamics" — use REINFORCE for discrete
 
     # Two-hot bins for symlog-spaced critic targets (paper §App.B)

@@ -125,10 +125,16 @@ class Actor(nn.Module):
         mean, _ = out.chunk(2, dim=-1)
         return torch.tanh(mean)
 
-    def sample_with_log_prob(self, feat: Tensor) -> Tuple[Tensor, Tensor]:
+    def sample_with_log_prob(self, feat: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
-        Reparameterised sample + log probability.   [paper §3, actor objective]
-        Returns: (action, log_prob)  both (B, A)
+        Reparameterised sample + log probability + Gaussian entropy.
+
+        Returns: (action, log_prob, entropy)  all (B,) except action (B, A)
+
+        entropy is the differential entropy of the pre-tanh Gaussian (per sample,
+        summed over action dims). It does NOT go through the tanh Jacobian, so its
+        gradient w.r.t. log_std is always non-zero even when the policy is saturated
+        and log_prob is clamped. Used exclusively for the entropy regularisation term.
         """
         out = self.net(feat)
         mean, log_std = out.chunk(2, dim=-1)
@@ -140,7 +146,12 @@ class Actor(nn.Module):
 
         # log-prob with tanh correction  [paper §App.B, tanh squash]
         log_prob = dist.log_prob(raw).sum(-1) - torch.log1p(-action.pow(2) + 1e-6).sum(-1)
-        return action, log_prob
+
+        # Gaussian entropy: H = Σ_i [0.5 + 0.5*log(2π) + log(σ_i)]
+        # Gradient flows through log_std regardless of action saturation.
+        entropy = dist.entropy().sum(-1)                    # (B,)
+
+        return action, log_prob, entropy
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,24 +279,29 @@ def actor_critic_loss(
     critic_loss = -(target_enc * F.log_softmax(critic_logits, dim=-1)).sum(-1).mean()
 
     # ── Actor loss: REINFORCE with normalised advantage   [paper §3] ─────────
-    _, log_prob = actor.sample_with_log_prob(feats.view(H * B, -1))
+    _, log_prob, entropy = actor.sample_with_log_prob(feats.view(H * B, -1))
     log_prob = log_prob.view(H, B)
-    # Clip log_prob from below to prevent tanh-saturation positive feedback:
-    # when policy std→max, the squashed Gaussian log_prob becomes large positive
-    # (via the Jacobian term -log(1-tanh²)), which amplifies REINFORCE gradients
-    # and causes a runaway collapse.
+    entropy  = entropy.view(H, B)
+    # Clamp log_prob to prevent tanh-Jacobian runaway on BOTH sides:
+    #   min: -log(1-tanh²) → +∞ when action→±1 gives large positive log_prob
+    #   max: Normal log_prob → +∞ when std→0 (very confident policy)
+    # Clamping kills gradient at the boundary — which is intentional: we stop
+    # REINFORCE from further rewarding saturated actions.
     log_prob = log_prob.clamp(min=cfg.log_prob_min, max=cfg.log_prob_max)
     advantage = (targets_norm - values[:H].detach() / normalizer.scale())
     actor_loss = -(log_prob * advantage.detach()).mean()
-    # entropy bonus   [paper §3, actor objective]
-    actor_loss = actor_loss - cfg.actor_entropy * (-log_prob).mean()
+    # Entropy bonus uses the RAW Gaussian entropy (not clamped log_prob).
+    # Gradient flows through log_std even when log_prob is at the clamp boundary,
+    # so the policy is always pushed toward higher-entropy (less saturated) actions.
+    actor_loss = actor_loss - cfg.actor_entropy * entropy.mean()
 
     metrics = {
         'ac/critic_loss':  critic_loss.item(),
         'ac/actor_loss':   actor_loss.item(),
         'ac/mean_return':  targets.mean().item(),
         'ac/return_scale': normalizer.scale(),
-        'ac/log_prob':     log_prob.mean().item(),     # monitor tanh saturation: floor=-10, healthy=-2 to 0
-        'ac/advantage':    advantage.mean().item(),    # should be near 0 mean; large negative = critic overestimates
+        'ac/log_prob':     log_prob.mean().item(),     # clamped; healthy: -3 to 0; ceiling=2.0 → saturated
+        'ac/entropy':      entropy.mean().item(),      # Gaussian entropy; healthy: 2-5; low → policy collapsed
+        'ac/advantage':    advantage.mean().item(),    # should hover near 0; large negative = critic overestimates
     }
     return actor_loss, critic_loss, metrics
