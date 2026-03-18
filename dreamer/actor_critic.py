@@ -280,5 +280,7 @@ def actor_critic_loss(
         'ac/actor_loss':   actor_loss.item(),
         'ac/mean_return':  targets.mean().item(),
         'ac/return_scale': normalizer.scale(),
+        'ac/log_prob':     log_prob.mean().item(),     # monitor tanh saturation: floor=-10, healthy=-2 to 0
+        'ac/advantage':    advantage.mean().item(),    # should be near 0 mean; large negative = critic overestimates
     }
     return actor_loss, critic_loss, metrics

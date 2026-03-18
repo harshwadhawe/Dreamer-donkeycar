@@ -9,6 +9,7 @@ For a quick smoke test:
     conda run -n dreamer-car python dreamer/train.py --tubs data/ --steps 100
 """
 from __future__ import annotations
+import copy
 import os
 import sys
 
@@ -56,7 +57,6 @@ def save_checkpoint(
         os.symlink(os.path.abspath(path), latest)
     except OSError:
         pass   # Windows may not support symlinks
-    print(f"[Train] Saved checkpoint → {path}")
 
 
 def train(cfg) -> None:
@@ -93,7 +93,6 @@ def train(cfg) -> None:
     bins = symlog_bins(cfg.twohot_low, cfg.twohot_high, cfg.twohot_bins, device)
 
     # ── Target critic (slow EMA of critic weights for stable bootstrap) ───────
-    import copy
     target_critic = copy.deepcopy(critic).to(device)
     for p in target_critic.parameters():
         p.requires_grad_(False)
@@ -105,7 +104,9 @@ def train(cfg) -> None:
 
     logger = Logger(cfg, log_dir=os.path.join(cfg.checkpoint_dir, "..", "logs"))
 
-    print("[Train] Starting training loop...")
+    print(f"[Train] WM warmup: {cfg.wm_warmup} steps before AC starts", flush=True)
+    print("[Train] Starting training loop...", flush=True)
+    _ac_started = False
     for step in range(1, cfg.steps + 1):
 
         # ────────────────────────────────────────────────────────────────────
@@ -133,8 +134,12 @@ def train(cfg) -> None:
             ac_metrics = {
                 'ac/critic_loss': 0.0, 'ac/actor_loss': 0.0,
                 'ac/mean_return': 0.0, 'ac/return_scale': 1.0,
+                'ac/log_prob': 0.0,    'ac/advantage': 0.0,
             }
         else:
+            if not _ac_started:
+                print(f"[Train] step={step}: WM warmup done — starting Actor-Critic training", flush=True)
+                _ac_started = True
             world_model.eval()
             actor.train()
             critic.train()
@@ -187,24 +192,31 @@ def train(cfg) -> None:
         if step % cfg.log_every == 0:
             metrics = {**wm_metrics, **ac_metrics, 'train/step': step}
             logger.log(metrics, step=step)
-            print(f"[Train] step={step:>7}  "
-                  f"wm={wm_metrics['wm/total']:.4f}  "
-                  f"kl={wm_metrics['wm/kl']:.4f}  "
-                  f"rec={wm_metrics['wm/rec_loss']:.4f}  "
-                  f"rew={wm_metrics['wm/rew_loss']:.4f}  "
-                  f"actor={ac_metrics['ac/actor_loss']:.4f}  "
-                  f"critic={ac_metrics['ac/critic_loss']:.4f}  "
-                  f"ret={ac_metrics['ac/mean_return']:.4f}")
+            print(
+                f"[Train] step={step:>7}  "
+                f"wm={wm_metrics['wm/total']:.4f}  "
+                f"kl={wm_metrics['wm/kl']:.4f}  "
+                f"rec={wm_metrics['wm/rec_loss']:.4f}  "
+                f"rew={wm_metrics['wm/rew_loss']:.4f}  "
+                f"cont={wm_metrics['wm/cont_loss']:.4f}  "
+                f"actor={ac_metrics['ac/actor_loss']:.4f}  "
+                f"critic={ac_metrics['ac/critic_loss']:.4f}  "
+                f"ret={ac_metrics['ac/mean_return']:.4f}  "
+                f"logp={ac_metrics['ac/log_prob']:.3f}  "
+                f"adv={ac_metrics['ac/advantage']:.3f}",
+                flush=True,
+            )
 
         if step % cfg.save_every == 0:
             save_checkpoint(step, world_model, actor, critic, target_critic,
                             wm_optim, actor_optim, critic_optim, cfg)
+            print(f"[Train] Saved checkpoint → ckpt_{step:08d}.pt", flush=True)
 
     # Final checkpoint
     save_checkpoint(cfg.steps, world_model, actor, critic, target_critic,
                     wm_optim, actor_optim, critic_optim, cfg)
     logger.close()
-    print("[Train] Done.")
+    print("[Train] Done.", flush=True)
 
 
 if __name__ == "__main__":
