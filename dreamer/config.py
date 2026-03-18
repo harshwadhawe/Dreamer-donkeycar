@@ -52,9 +52,11 @@ class DreamerConfig:
 
     # ── Actor-Critic ─────────────────────────────────────────────────────────
     imag_horizon: int = 15             # imagination rollout horizon H  (paper §App.B)
-    gamma: float = 0.997               # discount factor  (paper §App.B)
+    gamma: float = 0.95                # discount factor — lower than paper (0.997) because
+                                       # driving has dense reward ~0.3/step. V∞=0.3/0.05=6,
+                                       # which fits comfortably in the two-hot bin range.
     lam: float = 0.95                  # λ for lambda-returns  (paper Eq. 6)
-    actor_entropy: float = 3e-4         # entropy regularisation weight — applied to Gaussian
+    actor_entropy: float = 1e-4         # entropy regularisation weight — applied to Gaussian
                                        # entropy (not clamped log_prob), so gradient always
                                        # flows through log_std.
     actor_grad: str = "dynamics"       # "dynamics" (continuous actions, paper default) or
@@ -98,7 +100,7 @@ class DreamerConfig:
     sim_env: str = "donkey-warehouse-v0"
     sim_collect_every: int = 200       # collect sim data every N training steps
     sim_steps_per_collect: int = 100   # env steps per collection phase
-    sim_max_episode_steps: int = 500   # reset episode after this many steps
+    sim_max_episode_steps: int = 200   # reset episode after this many steps (~10s at 20Hz)
 
     # ── Device ───────────────────────────────────────────────────────────────
     device: str = "auto"               # "auto" → MPS > CUDA > CPU

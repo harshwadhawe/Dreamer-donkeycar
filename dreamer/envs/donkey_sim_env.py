@@ -161,13 +161,15 @@ class DonkeySimCollector:
         throttle  = float(action[1])
         cte       = abs(float(info.get("cte", 0.0)))
 
-        survival      = 0.1
-        speed         = max(0.0, throttle)
-        cte_penalty   = 0.3 * min(cte, 5.0)
-        steer_penalty = max(0.0, abs(steering) - 0.7) * 0.5
-        crash_penalty = 1.0 if (done and info.get("hit", False)) else 0.0
+        # Speed capped at 0.5, scaled by on-track factor so off-track driving
+        # earns nothing.  CTE penalty ramps steeply.  Crash = large negative.
+        speed       = min(0.5, max(0.0, throttle))
+        on_track    = max(0.0, 1.0 - cte / 3.0)   # 1.0 at center, 0.0 at 3m+
+        steer_cost  = abs(steering) * 0.2
+        cte_penalty = 0.5 * min(cte, 5.0)
+        crash_penalty = 2.0 if (done and info.get("hit", False)) else 0.0
 
-        return survival + speed - cte_penalty - steer_penalty - crash_penalty
+        return speed * on_track - steer_cost - cte_penalty - crash_penalty
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -204,6 +206,10 @@ class DonkeySimCollector:
             next_obs, _gym_rew, done, info = self.env.step(action)
             reward  = self._compute_reward(action, info, done)
             timeout = (self._episode_step + 1) >= self.cfg.sim_max_episode_steps
+            # Early reset if car is clearly off-track (CTE > 4m)
+            cte = abs(float(info.get("cte", 0.0)))
+            if cte > 4.0:
+                done = True
 
             self._episode.add({
                 "image":       image,

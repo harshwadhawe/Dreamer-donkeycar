@@ -145,15 +145,16 @@ class DonkeyTubEnv:
             throttle = float(rec.get("user/throttle", 0.0))
 
             action = np.array([angle, throttle], dtype=np.float32)
-            # Reward: survival bonus + speed - extreme steering penalty.
-            # survival (0.1/step): constant signal even when coasting.
-            # speed: rewards forward progress, allows any steering angle.
-            # steer_penalty: only activates at |angle| > 0.7 to discourage
-            #   lock-to-lock spinning without penalising normal cornering.
-            survival     = 0.1
-            speed        = max(0.0, float(throttle))
-            steer_penalty = max(0.0, abs(angle) - 0.7) * 0.5
-            reward = survival + speed - steer_penalty
+            # Reward: moderate speed with proportional steering cost.
+            # speed: capped at 0.5 so full-throttle-into-wall ≈ 0.3, not 1.1.
+            # steer_cost: proportional from 0 — any deviation costs something,
+            #   encouraging smooth driving rather than only penalising extremes.
+            # Good human driving (throttle~0.3, angle~0.1) → ~0.28
+            # Full throttle + hard steer (1.0, 0.8) → 0.5 - 0.16 = 0.34
+            # The range is narrow so the actor must learn nuance.
+            speed      = min(0.5, max(0.0, float(throttle)))
+            steer_cost = abs(angle) * 0.2
+            reward = speed - steer_cost
 
             transitions.append({
                 "image":       image,                 # (H, W, 3) uint8
