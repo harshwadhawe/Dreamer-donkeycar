@@ -106,18 +106,18 @@ def train(cfg) -> None:
     logger = Logger(cfg, log_dir=os.path.join(cfg.checkpoint_dir, "..", "logs"))
 
     # ── Online simulator collector (optional) ─────────────────────────────────
+    # NOTE: We do NOT connect here — the sim idles out during WM warmup
+    # (2000 steps with no communication → BrokenPipeError).  Instead we
+    # create the collector now and connect lazily on first use (after warmup).
     collector: DonkeySimCollector | None = None
     if cfg.use_sim:
         collector = DonkeySimCollector(cfg, world_model, actor, buffer)
-        if not collector.connect(device):
-            collector = None   # disabled — sim not reachable
-        else:
-            print(
-                f"[Train] Sim collection every {cfg.sim_collect_every} steps, "
-                f"{cfg.sim_steps_per_collect} steps/collect, "
-                f"max_ep={cfg.sim_max_episode_steps}",
-                flush=True,
-            )
+        print(
+            f"[Train] Sim collection every {cfg.sim_collect_every} steps, "
+            f"{cfg.sim_steps_per_collect} steps/collect, "
+            f"max_ep={cfg.sim_max_episode_steps}  (connects after WM warmup)",
+            flush=True,
+        )
 
     print(f"[Train] WM warmup: {cfg.wm_warmup} steps before AC starts", flush=True)
     print("[Train] Starting training loop...", flush=True)
@@ -220,6 +220,11 @@ def train(cfg) -> None:
         # Online sim collection (interleaved with training)
         # ────────────────────────────────────────────────────────────────────
         if collector is not None and step % cfg.sim_collect_every == 0 and step > cfg.wm_warmup:
+            # Lazy connect: first collection after warmup opens the sim socket
+            if collector.env is None:
+                if not collector.connect(device):
+                    collector = None
+                    continue
             sim_metrics = collector.collect(cfg.sim_steps_per_collect, explore=False)
             logger.log(sim_metrics, step=step)
             print(
