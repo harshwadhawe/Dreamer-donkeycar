@@ -32,14 +32,17 @@ class DreamerConfig:
     # RSSM discrete latent: 32 categories × 32 classes  (paper §2)
     rssm_categories: int = 32
     rssm_classes: int = 32
-    rssm_hidden: int = 512             # GRU hidden size (h_t)
+    rssm_hidden: int = 256             # GRU hidden size — reduced from 512 to bottleneck h,
+                                       # forcing z to carry information (prevents KL floor collapse)
     rssm_embed: int = 512              # CNN encoder output dimension
     mlp_hidden: int = 512              # hidden size for all MLPs
 
     # KL balancing (paper §App.B): α=0.8 → 80% prior, 20% posterior
     kl_balance: float = 0.8
     kl_free: float = 0.1               # free-bits threshold (nats) — clip below this
-    kl_scale: float = 3.0              # overall KL loss scale (raised to force z to carry info)
+    kl_scale: float = 1.0              # KL loss scale — back to 1.0; high kl_scale above the
+                                       # free-bits floor has zero gradient (clamp kills it) and
+                                       # actually harms z when KL > floor by over-penalising
     rec_scale: float = 1.0             # reconstruction loss scale
     rew_scale: float = 1.0             # reward prediction loss scale
     cont_scale: float = 1.0            # continuation prediction loss scale
@@ -48,7 +51,8 @@ class DreamerConfig:
     unimix: float = 0.01
 
     # ── Actor-Critic ─────────────────────────────────────────────────────────
-    imag_horizon: int = 15             # imagination rollout horizon H  (paper §3)
+    imag_horizon: int = 8              # imagination rollout horizon H — reduced from 15
+                                       # shorter horizon = less OOD divergence when z is still learning
     gamma: float = 0.997               # discount factor
     lam: float = 0.95                  # λ for lambda-returns  (paper Eq. 6)
     actor_entropy: float = 3e-4        # entropy regularisation weight

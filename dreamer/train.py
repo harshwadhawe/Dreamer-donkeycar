@@ -190,8 +190,11 @@ def train(cfg) -> None:
             print(f"[Train] step={step:>7}  "
                   f"wm={wm_metrics['wm/total']:.4f}  "
                   f"kl={wm_metrics['wm/kl']:.4f}  "
+                  f"rec={wm_metrics['wm/rec_loss']:.4f}  "
+                  f"rew={wm_metrics['wm/rew_loss']:.4f}  "
                   f"actor={ac_metrics['ac/actor_loss']:.4f}  "
-                  f"critic={ac_metrics['ac/critic_loss']:.4f}")
+                  f"critic={ac_metrics['ac/critic_loss']:.4f}  "
+                  f"ret={ac_metrics['ac/mean_return']:.4f}")
 
         if step % cfg.save_every == 0:
             save_checkpoint(step, world_model, actor, critic, target_critic,
