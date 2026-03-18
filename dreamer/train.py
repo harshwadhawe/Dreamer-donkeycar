@@ -219,9 +219,8 @@ def train(cfg) -> None:
         # ────────────────────────────────────────────────────────────────────
         # Online sim collection (interleaved with training)
         # ────────────────────────────────────────────────────────────────────
-        if collector is not None and step % cfg.sim_collect_every == 0:
-            explore = step <= cfg.wm_warmup
-            sim_metrics = collector.collect(cfg.sim_steps_per_collect, explore=explore)
+        if collector is not None and step % cfg.sim_collect_every == 0 and step > cfg.wm_warmup:
+            sim_metrics = collector.collect(cfg.sim_steps_per_collect, explore=False)
             logger.log(sim_metrics, step=step)
             print(
                 f"[SimCollector] step={step}  "

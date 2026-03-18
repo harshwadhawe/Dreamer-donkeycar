@@ -51,6 +51,7 @@ class DonkeySimCollector:
         self._last_obs: np.ndarray | None = None
         self._episode = None
         self._episode_step: int = 0
+        self._low_speed_count: int = 0   # consecutive low-speed steps
         self._total_steps: int = 0
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -65,6 +66,8 @@ class DonkeySimCollector:
                 "host": self.cfg.sim_host,
                 "port": self.cfg.sim_port,
                 "cam_resolution": (120, 160),
+                "max_cte": 3.0,          # tighter than default 8.0 → terminates off-track sooner
+                "frame_skip": 1,
             }
             self.env = gym.make(self.cfg.sim_env, conf=conf)
             obs = self.env.reset()
@@ -106,6 +109,7 @@ class DonkeySimCollector:
         self._last_obs = raw_obs
         self._episode = Episode()
         self._episode_step = 0
+        self._low_speed_count = 0
 
     @torch.no_grad()
     def _select_action(self, image: np.ndarray, explore: bool) -> np.ndarray:
@@ -144,32 +148,42 @@ class DonkeySimCollector:
             action, _, _ = self.actor.sample_with_log_prob(feat)
             action = action.squeeze(0).cpu().numpy()
 
+        # Smooth steering (EMA) to reduce jitter — same trick as ian0/donkeycar-rl.
+        # Only smooth steering (idx 0), leave throttle (idx 1) responsive.
+        alpha = 0.6
+        action[0] = alpha * action[0] + (1 - alpha) * self._last_action[0]
+
         return np.clip(action, -1.0, 1.0).astype(np.float32)
 
     @staticmethod
     def _compute_reward(action: np.ndarray, info: dict, done: bool) -> float:
         """
-        CTE-aware reward, aligned with the Option A offline reward shape:
+        CTE-aware reward inspired by SAC trainer's bell-curve shaping.
 
-            survival  +  speed  -  cte_penalty  -  steer_penalty  -  crash_penalty
-
-        cte_penalty : 0 on-track, increases linearly up to 5 m off-track.
-        steer_penalty: activates only when |steering| > 0.7 (lock-to-lock spin).
-        crash_penalty: −1 on wall hit so cont_head gets a real negative signal.
+        Components (all bounded so returns stay in two-hot bin range):
+          +speed    : capped throttle, rewarding forward motion
+          +centering: Gaussian bell curve on CTE (peak at center, smooth decay)
+          -steer    : proportional steering cost
+          -crash    : strong penalty on wall hit
         """
+        import math
         steering = float(action[0])
-        throttle  = float(action[1])
-        cte       = abs(float(info.get("cte", 0.0)))
+        throttle = float(action[1])
+        cte      = float(info.get("cte", 0.0))
 
-        # Speed capped at 0.5, scaled by on-track factor so off-track driving
-        # earns nothing.  CTE penalty ramps steeply.  Crash = large negative.
-        speed       = min(0.5, max(0.0, throttle))
-        on_track    = max(0.0, 1.0 - cte / 3.0)   # 1.0 at center, 0.0 at 3m+
-        steer_cost  = abs(steering) * 0.2
-        cte_penalty = 0.5 * min(cte, 5.0)
+        # Speed: capped so full-throttle doesn't dominate
+        speed = min(0.5, max(0.0, throttle))
+
+        # CTE bell curve: exp(-(cte/σ)²), σ=0.5 → reward ≈1.0 at center,
+        # ≈0.02 at 1.4m off.  Smoother gradient than linear penalty.
+        centering = math.exp(-(cte / 0.5) ** 2)
+
+        steer_cost    = abs(steering) * 0.15
         crash_penalty = 2.0 if (done and info.get("hit", False)) else 0.0
 
-        return speed * on_track - steer_cost - cte_penalty - crash_penalty
+        # reward range: ~[-2.15, +1.0]  →  with γ=0.95, V∞ ∈ [-43, 20]
+        # symlog(20)=3.04, symlog(-43)=-3.81  →  fits in [-20,20] bins easily
+        return speed + centering - steer_cost - crash_penalty
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -206,9 +220,21 @@ class DonkeySimCollector:
             next_obs, _gym_rew, done, info = self.env.step(action)
             reward  = self._compute_reward(action, info, done)
             timeout = (self._episode_step + 1) >= self.cfg.sim_max_episode_steps
-            # Early reset if car is clearly off-track (CTE > 4m)
+
+            # Early reset: off-track (CTE > 4m)
             cte = abs(float(info.get("cte", 0.0)))
             if cte > 4.0:
+                done = True
+
+            # Early reset: spinning/standstill detection.
+            # If speed < 1.0 for 30+ consecutive steps the car is stuck or
+            # doing tight donuts (the 2.23s "laps" in logs).
+            speed = float(info.get("speed", 0.0))
+            if speed < 1.0:
+                self._low_speed_count += 1
+            else:
+                self._low_speed_count = 0
+            if self._low_speed_count >= 30:
                 done = True
 
             self._episode.add({
