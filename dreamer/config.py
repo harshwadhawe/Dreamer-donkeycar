@@ -75,7 +75,10 @@ class DreamerConfig:
     # ── Training stability ───────────────────────────────────────────────────
     wm_warmup: int = 2000              # steps to train WM-only before starting AC
     critic_ema_decay: float = 0.98     # EMA decay for slow target critic
-    log_prob_min: float = -10.0        # floor for actor log_prob (prevents tanh saturation runaway)
+    log_prob_min: float = -10.0        # floor for actor log_prob
+    log_prob_max: float = 2.0          # ceiling for actor log_prob — prevents POSITIVE tanh-Jacobian
+                                       # runaway: -log(1-tanh²) → +13.8/dim when action≈±1,
+                                       # which makes REINFORCE reward saturation → feedback loop
 
     # ── Logging / checkpointing ──────────────────────────────────────────────
     log_every: int = 100               # log metrics every N gradient steps
@@ -85,6 +88,15 @@ class DreamerConfig:
     use_tensorboard: bool = True
     wandb_project: str = "dreamer-car"
     run_name: str = "dreamer_v3"
+
+    # ── Online simulator collection ──────────────────────────────────────────
+    use_sim: bool = False              # enable live DonkeyGym data collection
+    sim_host: str = "localhost"
+    sim_port: int = 9091
+    sim_env: str = "donkey-warehouse-v0"
+    sim_collect_every: int = 200       # collect sim data every N training steps
+    sim_steps_per_collect: int = 100   # env steps per collection phase
+    sim_max_episode_steps: int = 500   # reset episode after this many steps
 
     # ── Device ───────────────────────────────────────────────────────────────
     device: str = "auto"               # "auto" → MPS > CUDA > CPU
@@ -96,12 +108,23 @@ def parse_config() -> DreamerConfig:
 
     parser = argparse.ArgumentParser(description="DreamerV3 for Donkeycar")
     for f in fields(cfg):
-        parser.add_argument(
-            f"--{f.name}",
-            type=type(getattr(cfg, f.name)),
-            default=getattr(cfg, f.name),
-            help=f"(default: {getattr(cfg, f.name)})",
-        )
+        val = getattr(cfg, f.name)
+        if isinstance(val, bool):
+            # argparse type=bool is broken: bool("False") == True.
+            # Accept "true/1/yes" as True, everything else as False.
+            parser.add_argument(
+                f"--{f.name}",
+                type=lambda v: v.lower() in ("true", "1", "yes"),
+                default=val,
+                help=f"(default: {val})",
+            )
+        else:
+            parser.add_argument(
+                f"--{f.name}",
+                type=type(val),
+                default=val,
+                help=f"(default: {val})",
+            )
 
     args, _ = parser.parse_known_args()
     for f in fields(cfg):

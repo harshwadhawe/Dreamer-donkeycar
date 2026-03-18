@@ -228,7 +228,12 @@ def actor_critic_loss(
     feat_flat = feats.view(H * B, -1)
     with torch.no_grad():
         imag_rew  = reward_head(feat_flat).view(H, B).float()   # symlog rewards
-        imag_cont = torch.sigmoid(cont_head(feat_flat)).view(H, B)
+        # cont_head is unreliable when trained on tub data: is_terminal=1 only on the
+        # last frame of each recording session (human never crashed), so the head
+        # learns "always continue" → cont≈1 everywhere → BCE loss≈0.
+        # Use a fixed discount mask (all-ones) so gamma in lambda_returns provides
+        # the geometric discount instead of relying on the learned cont signal.
+        imag_cont = torch.ones(H, B, device=feat_flat.device)
 
     # ── Critic values over imagination trajectory ────────────────────────────
     # Use target critic (slow EMA) for stable bootstrap values if available,
@@ -269,7 +274,7 @@ def actor_critic_loss(
     # when policy std→max, the squashed Gaussian log_prob becomes large positive
     # (via the Jacobian term -log(1-tanh²)), which amplifies REINFORCE gradients
     # and causes a runaway collapse.
-    log_prob = log_prob.clamp(min=cfg.log_prob_min)
+    log_prob = log_prob.clamp(min=cfg.log_prob_min, max=cfg.log_prob_max)
     advantage = (targets_norm - values[:H].detach() / normalizer.scale())
     actor_loss = -(log_prob * advantage.detach()).mean()
     # entropy bonus   [paper §3, actor objective]

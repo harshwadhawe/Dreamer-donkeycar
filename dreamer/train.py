@@ -24,6 +24,7 @@ from dreamer.actor_critic import Actor, Critic, ReturnNormalizer, actor_critic_l
 from dreamer.replay_buffer import ReplayBuffer
 from dreamer.logger import Logger
 from dreamer.envs.donkey_env import DonkeyTubEnv
+from dreamer.envs.donkey_sim_env import DonkeySimCollector
 
 
 def save_checkpoint(
@@ -103,6 +104,20 @@ def train(cfg) -> None:
     critic_optim = torch.optim.Adam(critic.parameters(),      lr=cfg.ac_lr,  eps=cfg.eps)
 
     logger = Logger(cfg, log_dir=os.path.join(cfg.checkpoint_dir, "..", "logs"))
+
+    # ── Online simulator collector (optional) ─────────────────────────────────
+    collector: DonkeySimCollector | None = None
+    if cfg.use_sim:
+        collector = DonkeySimCollector(cfg, world_model, actor, buffer)
+        if not collector.connect(device):
+            collector = None   # disabled — sim not reachable
+        else:
+            print(
+                f"[Train] Sim collection every {cfg.sim_collect_every} steps, "
+                f"{cfg.sim_steps_per_collect} steps/collect, "
+                f"max_ep={cfg.sim_max_episode_steps}",
+                flush=True,
+            )
 
     print(f"[Train] WM warmup: {cfg.wm_warmup} steps before AC starts", flush=True)
     print("[Train] Starting training loop...", flush=True)
@@ -187,6 +202,22 @@ def train(cfg) -> None:
                     tp.data.mul_(d).add_(cp.data, alpha=1.0 - d)
 
         # ────────────────────────────────────────────────────────────────────
+        # Online sim collection (interleaved with training)
+        # ────────────────────────────────────────────────────────────────────
+        if collector is not None and step % cfg.sim_collect_every == 0:
+            explore = step <= cfg.wm_warmup
+            sim_metrics = collector.collect(cfg.sim_steps_per_collect, explore=explore)
+            logger.log(sim_metrics, step=step)
+            print(
+                f"[SimCollector] step={step}  "
+                f"collected={sim_metrics['sim/steps']}  "
+                f"episodes={sim_metrics['sim/episodes']}  "
+                f"mean_reward={sim_metrics['sim/mean_reward']:.3f}  "
+                f"total={sim_metrics['sim/total_steps']}",
+                flush=True,
+            )
+
+        # ────────────────────────────────────────────────────────────────────
         # Logging & checkpointing
         # ────────────────────────────────────────────────────────────────────
         if step % cfg.log_every == 0:
@@ -215,6 +246,8 @@ def train(cfg) -> None:
     # Final checkpoint
     save_checkpoint(cfg.steps, world_model, actor, critic, target_critic,
                     wm_optim, actor_optim, critic_optim, cfg)
+    if collector is not None:
+        collector.close()
     logger.close()
     print("[Train] Done.", flush=True)
 

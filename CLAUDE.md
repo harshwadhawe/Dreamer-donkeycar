@@ -87,6 +87,7 @@ conda run -n dreamer-car python manage.py drive --js
 conda run -n dreamer-car python dreamer/train.py --tubs data/ --steps 100000
 
 # SSH-safe: run in tmux so job survives disconnect
+mkdir -p dreamer/logs
 tmux new-session -d -s dreamer
 tmux send-keys -t dreamer 'python dreamer/train.py --tubs data/ --steps 100000 2>&1 | tee dreamer/logs/train_$(date +%Y%m%d_%H%M%S).log' Enter
 # Reattach later: tmux attach -t dreamer
@@ -123,11 +124,13 @@ open /Users/harshwadhawe/sim/DonkeySimMac/donkey_sim.app
 
 pkill -f donkey_sim
 # Run sim in tmux so it survives terminal close:
+mkdir -p dreamer/logs
 tmux new-session -d -s sim
 tmux send-keys -t sim '~/sim/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim 2>&1 | tee dreamer/logs/sim_$(date +%Y%m%d_%H%M%S).log' Enter
 # Reattach: tmux attach -t sim  |  Kill: tmux kill-session -t sim
 
 # Linux GPU server sim:
+mkdir -p dreamer/logs
 tmux new-session -d -s sim
 tmux send-keys -t sim './DonkeySimLinux/donkey_sim.x86_64 --port 9091 2>&1 | tee dreamer/logs/sim_$(date +%Y%m%d_%H%M%S).log' Enter
 
