@@ -86,6 +86,13 @@ conda run -n dreamer-car python manage.py drive --js
 # Train DreamerV3 offline on collected tubs
 conda run -n dreamer-car python dreamer/train.py --tubs data/ --steps 100000
 
+# SSH-safe: run in tmux so job survives disconnect
+tmux new-session -d -s dreamer
+tmux send-keys -t dreamer 'python dreamer/train.py --tubs data/ --steps 100000 2>&1 | tee dreamer/logs/train_$(date +%Y%m%d_%H%M%S).log' Enter
+# Reattach later: tmux attach -t dreamer
+# Check running:  tmux ls
+# Kill session:   tmux kill-session -t dreamer
+
 # Smoke test (100 steps, synthetic data)
 conda run -n dreamer-car python dreamer/train.py --steps 100
 
@@ -114,8 +121,15 @@ scp 4060:~/harsh/Dreamer-donkeycar/dreamer/checkpoints/ckpt_00013000.pt ~/dreame
 # 2. Start the simulator (separate window)
 open /Users/harshwadhawe/sim/DonkeySimMac/donkey_sim.app
 
-pkill -f donkey_sim                                                        
-~/sim/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim
+pkill -f donkey_sim
+# Run sim in tmux so it survives terminal close:
+tmux new-session -d -s sim
+tmux send-keys -t sim '~/sim/DonkeySimMac/donkey_sim.app/Contents/MacOS/donkey_sim 2>&1 | tee dreamer/logs/sim_$(date +%Y%m%d_%H%M%S).log' Enter
+# Reattach: tmux attach -t sim  |  Kill: tmux kill-session -t sim
+
+# Linux GPU server sim:
+tmux new-session -d -s sim
+tmux send-keys -t sim './DonkeySimLinux/donkey_sim.x86_64 --port 9091 2>&1 | tee dreamer/logs/sim_$(date +%Y%m%d_%H%M%S).log' Enter
 
 # 3. Run the autopilot against it
 conda run -n dreamer-car python drive_dreamer_sim.py  --checkpoint dreamer/checkpoints/ckpt_00013000.pt

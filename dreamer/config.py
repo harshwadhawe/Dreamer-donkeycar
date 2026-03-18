@@ -38,8 +38,8 @@ class DreamerConfig:
 
     # KL balancing (paper §App.B): α=0.8 → 80% prior, 20% posterior
     kl_balance: float = 0.8
-    kl_free: float = 0.5               # free-bits threshold (nats) — clip below this
-    kl_scale: float = 1.0              # overall KL loss scale
+    kl_free: float = 0.1               # free-bits threshold (nats) — clip below this
+    kl_scale: float = 3.0              # overall KL loss scale (raised to force z to carry info)
     rec_scale: float = 1.0             # reconstruction loss scale
     rew_scale: float = 1.0             # reward prediction loss scale
     cont_scale: float = 1.0            # continuation prediction loss scale
